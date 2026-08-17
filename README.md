@@ -9,7 +9,9 @@
 - CLI 交互式聊天
 - 流式输出
 - 单个个人会话
-- SQLite 会话持久化
+- 基于 `sessions` / `messages` 的结构化 SQLite 会话持久化
+- 按轮次批量追加消息，保留完整 `AgentMessage` JSON
+- FTS5 全文搜索、中文 trigram 搜索与 LIKE 兜底
 - 应用层 `SessionStore` 抽象
 - 后续可扩展的 `ChatService` 边界
 
@@ -66,12 +68,11 @@ export EVANSCLAW_MODEL="deepseek-v4-pro"
 
 ## 后续设计方向
 
-1. 把 `InMemorySessionStore` 换成 SQLite
-2. 为每个外部聊天会话维护独立 Agent
-3. 增加 Telegram 或飞书 Channel Adapter
-4. 以 `AgentTool` 形式逐个增加只读工具
-5. 为写入、发送、删除类工具增加权限确认
-6. 增加长期记忆、定时任务和事件触发
+1. 为每个外部聊天会话维护独立 Agent
+2. 增加 Telegram 或飞书 Channel Adapter
+3. 以 `AgentTool` 形式逐个增加只读工具
+4. 为写入、发送、删除类工具增加权限确认
+5. 增加 Context 压缩、长期记忆、定时任务和事件触发
 
 会话数据库默认保存到：
 
