@@ -9,9 +9,21 @@ import {
   initializeSessionSchema,
 } from "./session-schema.js";
 import {
+  extractMessageText,
   normalizeMessage,
   type NormalizedMessage,
 } from "./message-text.js";
+import {
+  chooseSearchRoute,
+  clampSearchLimit,
+  clampSearchOffset,
+  escapeLikeTerm,
+  normalizeSearchQuery,
+  toFtsQuery,
+  toLikeTerms,
+  type SessionSearchOptions,
+  type SessionSearchResult,
+} from "./session-search.js";
 
 export interface SessionMetadata {
   conversationId?: string;
@@ -48,6 +60,10 @@ export interface SessionStore {
   ): Promise<SessionRecord>;
   load(sessionId: string): Promise<AgentMessage[]>;
   append(sessionId: string, messages: AgentMessage[]): Promise<void>;
+  search(
+    query: string,
+    options?: SessionSearchOptions,
+  ): Promise<SessionSearchResult[]>;
   clear(sessionId: string): Promise<void>;
 }
 
@@ -55,6 +71,19 @@ type InMemorySession = {
   record: SessionRecord;
   messages: AgentMessage[];
 };
+
+const WRITE_RETRY_DELAYS_MS = [25, 50, 100, 200, 400] as const;
+
+function isBusyError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message.toLowerCase() : "";
+  return message.includes("database is locked") || message.includes("database is busy");
+}
+
+/** DatabaseSync is synchronous, so use a bounded blocking wait between retries. */
+function sleepSync(milliseconds: number): void {
+  const signal = new Int32Array(new SharedArrayBuffer(4));
+  Atomics.wait(signal, 0, 0, milliseconds);
+}
 
 export class InMemorySessionStore implements SessionStore {
   private readonly sessions = new Map<string, InMemorySession>();
@@ -101,6 +130,69 @@ export class InMemorySessionStore implements SessionStore {
     current.record.updatedAt = Date.now();
   }
 
+  async search(
+    query: string,
+    options: SessionSearchOptions = {},
+  ): Promise<SessionSearchResult[]> {
+    const normalizedQuery = normalizeSearchQuery(query);
+    const terms = toLikeTerms(normalizedQuery);
+    if (terms.length === 0) return [];
+
+    const matchingSessions = [...this.sessions.values()].filter(({ record }) => {
+      if (options.sessionId && record.id !== options.sessionId) return false;
+      if (options.conversationId && record.conversationId !== options.conversationId) {
+        return false;
+      }
+      if (options.channel && record.channel !== options.channel) return false;
+      if (options.userId && record.userId !== options.userId) return false;
+      return true;
+    });
+
+    const results: SessionSearchResult[] = [];
+    for (const { record, messages } of matchingSessions) {
+      messages.forEach((message, sequence) => {
+        const content = extractMessageText(message);
+        if (!content) return;
+        if (options.role && message.role !== options.role) return;
+
+        const lowerContent = content.toLocaleLowerCase();
+        if (!terms.every((term) => lowerContent.includes(term.toLocaleLowerCase()))) {
+          return;
+        }
+
+        const firstTerm = terms[0].toLocaleLowerCase();
+        const matchIndex = lowerContent.indexOf(firstTerm);
+        const start = Math.max(0, matchIndex - 60);
+        const end = Math.min(content.length, start + 160);
+        const snippet = `${start > 0 ? "..." : ""}${content.slice(start, end)}${
+          end < content.length ? "..." : ""
+        }`;
+        const timestamp = (message as { timestamp?: unknown }).timestamp;
+
+        results.push({
+          messageId: sequence + 1,
+          sessionId: record.id,
+          conversationId: record.conversationId,
+          channel: record.channel,
+          userId: record.userId,
+          role: message.role,
+          sequence,
+          content,
+          snippet,
+          createdAt:
+            typeof timestamp === "number" && Number.isFinite(timestamp)
+              ? timestamp
+              : record.updatedAt,
+        });
+      });
+    }
+
+    const offset = clampSearchOffset(options.offset);
+    return results
+      .sort((left, right) => right.createdAt - left.createdAt)
+      .slice(offset, offset + clampSearchLimit(options.limit));
+  }
+
   async clear(sessionId: string): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session) return;
@@ -128,6 +220,19 @@ type SessionRow = {
 
 type MessageRow = {
   raw_json: string;
+};
+
+type SearchRow = {
+  id: number;
+  session_id: string;
+  conversation_id: string;
+  channel: string;
+  user_id: string;
+  role: string;
+  sequence: number;
+  content: string | null;
+  snippet: string | null;
+  created_at: number;
 };
 
 /**
@@ -309,6 +414,38 @@ export class SqliteSessionStore implements SessionStore {
     });
   }
 
+  async search(
+    query: string,
+    options: SessionSearchOptions = {},
+  ): Promise<SessionSearchResult[]> {
+    const normalizedQuery = normalizeSearchQuery(query);
+    const terms = toLikeTerms(normalizedQuery);
+    if (terms.length === 0) return [];
+
+    const route = chooseSearchRoute(normalizedQuery);
+    const limit = clampSearchLimit(options.limit);
+    const offset = clampSearchOffset(options.offset);
+
+    if (route === "like") {
+      return this.searchLike(terms, options, limit, offset);
+    }
+
+    try {
+      return this.searchFts(
+        route === "trigram" ? "messages_fts_trigram" : "messages_fts",
+        toFtsQuery(normalizedQuery),
+        options,
+        limit,
+        offset,
+      );
+    } catch {
+      // FTS is a derived index. A damaged or unavailable index must not make
+      // historical messages undiscoverable; canonical content remains in
+      // messages and can be searched with the slower LIKE fallback.
+      return this.searchLike(terms, options, limit, offset);
+    }
+  }
+
   async clear(sessionId: string): Promise<void> {
     this.withWriteTransaction(() => {
       const session = this.getSessionStatement.get(sessionId);
@@ -374,20 +511,155 @@ export class SqliteSessionStore implements SessionStore {
     };
   }
 
+  private searchFts(
+    table: "messages_fts" | "messages_fts_trigram",
+    ftsQuery: string,
+    options: SessionSearchOptions,
+    limit: number,
+    offset: number,
+  ): SessionSearchResult[] {
+    const where = [`${table} MATCH ?`];
+    const parameters: Array<string | number> = [ftsQuery];
+    this.addSearchScope(where, parameters, options);
+    parameters.push(limit, offset);
+
+    const rows = this.database
+      .prepare(`
+        SELECT
+          m.id,
+          m.session_id,
+          s.conversation_id,
+          s.channel,
+          s.user_id,
+          m.role,
+          m.sequence,
+          m.content,
+          snippet(${table}, 0, '[', ']', '...', 32) AS snippet,
+          m.created_at
+        FROM ${table}
+        JOIN messages m ON m.id = ${table}.rowid
+        JOIN sessions s ON s.id = m.session_id
+        WHERE ${where.join(" AND ")}
+        ORDER BY bm25(${table}) ASC, m.created_at DESC, m.id DESC
+        LIMIT ? OFFSET ?
+      `)
+      .all(...parameters) as unknown as SearchRow[];
+
+    return rows.map((row) => this.toSearchResult(row));
+  }
+
+  private searchLike(
+    terms: string[],
+    options: SessionSearchOptions,
+    limit: number,
+    offset: number,
+  ): SessionSearchResult[] {
+    const where: string[] = [];
+    const parameters: Array<string | number> = [];
+    for (const term of terms) {
+      where.push("COALESCE(m.content, '') LIKE ? ESCAPE '\\'");
+      parameters.push(`%${escapeLikeTerm(term)}%`);
+    }
+    this.addSearchScope(where, parameters, options);
+    parameters.push(limit, offset);
+
+    const rows = this.database
+      .prepare(`
+        SELECT
+          m.id,
+          m.session_id,
+          s.conversation_id,
+          s.channel,
+          s.user_id,
+          m.role,
+          m.sequence,
+          m.content,
+          NULL AS snippet,
+          m.created_at
+        FROM messages m
+        JOIN sessions s ON s.id = m.session_id
+        WHERE ${where.join(" AND ")}
+        ORDER BY m.created_at DESC, m.id DESC
+        LIMIT ? OFFSET ?
+      `)
+      .all(...parameters) as unknown as SearchRow[];
+
+    return rows.map((row) => this.toSearchResult(row));
+  }
+
+  private addSearchScope(
+    where: string[],
+    parameters: Array<string | number>,
+    options: SessionSearchOptions,
+  ): void {
+    if (options.sessionId) {
+      where.push("m.session_id = ?");
+      parameters.push(options.sessionId);
+    }
+    if (options.conversationId) {
+      where.push("s.conversation_id = ?");
+      parameters.push(options.conversationId);
+    }
+    if (options.channel) {
+      where.push("s.channel = ?");
+      parameters.push(options.channel);
+    }
+    if (options.userId) {
+      where.push("s.user_id = ?");
+      parameters.push(options.userId);
+    }
+    if (options.role) {
+      where.push("m.role = ?");
+      parameters.push(options.role);
+    }
+  }
+
+  private toSearchResult(row: SearchRow): SessionSearchResult {
+    const content = row.content ?? null;
+    const snippet = row.snippet ?? this.makeFallbackSnippet(content);
+    return {
+      messageId: Number(row.id),
+      sessionId: row.session_id,
+      conversationId: row.conversation_id,
+      channel: row.channel,
+      userId: row.user_id,
+      role: row.role,
+      sequence: Number(row.sequence),
+      content,
+      snippet,
+      createdAt: Number(row.created_at),
+    };
+  }
+
+  private makeFallbackSnippet(content: string | null): string {
+    if (!content) return "";
+    return content.length > 160 ? `${content.slice(0, 160)}...` : content;
+  }
+
   /**
    * BEGIN IMMEDIATE obtains the SQLite write lock before any message row is
    * changed. FTS trigger work and the session counter update therefore commit
-   * or roll back together with the canonical transcript.
+   * or roll back together with the canonical transcript. Short jittered
+   * retries handle another process briefly holding SQLite's single writer
+   * lock without turning normal contention into data loss.
    */
   private withWriteTransaction<T>(operation: () => T): T {
-    this.database.exec("BEGIN IMMEDIATE");
-    try {
-      const result = operation();
-      this.database.exec("COMMIT");
-      return result;
-    } catch (error) {
-      if (this.database.isTransaction) this.database.exec("ROLLBACK");
-      throw error;
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        this.database.exec("BEGIN IMMEDIATE");
+        try {
+          const result = operation();
+          this.database.exec("COMMIT");
+          return result;
+        } catch (error) {
+          if (this.database.isTransaction) this.database.exec("ROLLBACK");
+          throw error;
+        }
+      } catch (error) {
+        const delay = WRITE_RETRY_DELAYS_MS[attempt];
+        if (!isBusyError(error) || delay === undefined) throw error;
+        sleepSync(delay);
+      }
     }
   }
 }
