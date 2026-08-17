@@ -258,12 +258,19 @@ export class SqliteSessionStore implements SessionStore {
     mkdirSync(dirname(databasePath), { recursive: true });
 
     this.database = new DatabaseSync(databasePath);
-    this.database.exec(`
-      PRAGMA journal_mode = WAL;
-      PRAGMA foreign_keys = ON;
-      PRAGMA busy_timeout = 1000;
-    `);
-    initializeSessionSchema(this.database);
+    try {
+      this.database.exec(`
+        PRAGMA journal_mode = WAL;
+        PRAGMA foreign_keys = ON;
+        PRAGMA busy_timeout = 1000;
+      `);
+      initializeSessionSchema(this.database);
+    } catch (error) {
+      // A failed schema initialization must not leak a live file descriptor,
+      // especially when the caller needs to remove a bad local database.
+      this.database.close();
+      throw error;
+    }
 
     this.getSessionStatement = this.database.prepare(`
       SELECT
