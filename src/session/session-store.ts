@@ -48,13 +48,6 @@ export interface SessionStore {
   ): Promise<SessionRecord>;
   load(sessionId: string): Promise<AgentMessage[]>;
   append(sessionId: string, messages: AgentMessage[]): Promise<void>;
-
-  /**
-   * Temporary compatibility method for callers that still save a complete
-   * transcript. New code must use append() so a turn is written only once.
-   */
-  save(sessionId: string, messages: AgentMessage[]): Promise<void>;
-
   clear(sessionId: string): Promise<void>;
 }
 
@@ -104,19 +97,6 @@ export class InMemorySessionStore implements SessionStore {
     if (!current) throw new Error(`会话 ${sessionId} 不存在。`);
 
     current.messages.push(...messages);
-    current.record.messageCount = current.messages.length;
-    current.record.updatedAt = Date.now();
-  }
-
-  /** @deprecated Use append() for new code. */
-  async save(sessionId: string, messages: AgentMessage[]): Promise<void> {
-    const session = this.sessions.get(sessionId);
-    if (!session) await this.getOrCreate(sessionId);
-
-    const current = this.sessions.get(sessionId);
-    if (!current) throw new Error(`会话 ${sessionId} 不存在。`);
-
-    current.messages = [...messages];
     current.record.messageCount = current.messages.length;
     current.record.updatedAt = Date.now();
   }
@@ -321,31 +301,6 @@ export class SqliteSessionStore implements SessionStore {
         sequence += 1;
       }
 
-      this.updateSessionCountStatement.run(
-        normalized.length,
-        Date.now(),
-        sessionId,
-      );
-    });
-  }
-
-  /**
-   * Compatibility path for the original ChatService. It still uses the
-   * structured tables and one transaction, but rewrites the transcript. This
-   * method is removed from the application path in the next integration step.
-   */
-  async save(sessionId: string, messages: AgentMessage[]): Promise<void> {
-    const normalized = messages.map((message) => normalizeMessage(message));
-
-    this.withWriteTransaction(() => {
-      this.ensureSessionRow(sessionId);
-      this.deleteMessagesStatement.run(sessionId);
-
-      normalized.forEach((message, sequence) => {
-        this.insertNormalizedMessage(sessionId, sequence, message);
-      });
-
-      this.resetSessionStatement.run(Date.now(), sessionId);
       this.updateSessionCountStatement.run(
         normalized.length,
         Date.now(),
