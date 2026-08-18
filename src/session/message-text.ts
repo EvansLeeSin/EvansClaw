@@ -28,10 +28,9 @@ function stringifyValue(value: unknown): string | undefined {
 }
 
 /**
- * Extract only useful text from a message's content blocks. The complete
- * message is still kept in raw_json, while this projection stays small and
- * suitable for FTS5. Image payloads and hidden thinking blocks are excluded
- * from the search projection by design.
+ * 从消息内容块中提取有搜索价值的文本。
+ * 完整消息仍然保存在 raw_json 中；这里的投影保持足够小，适合写入 FTS5。
+ * 按设计，图片数据和隐藏的 thinking 内容不会进入搜索投影。
  */
 function collectContentText(content: unknown): string[] {
   if (typeof content === "string") return [content];
@@ -52,17 +51,16 @@ function collectContentText(content: unknown): string[] {
       continue;
     }
 
-    // Tool calls are useful search targets even though they do not contain a
-    // regular text block. Do not index the whole object because provider
-    // metadata can be large and unstable.
+    // Tool call 虽然没有普通文本块，但工具名称和参数仍然具有搜索价值。
+    // 不要索引整个对象，因为 provider 元数据可能很大，而且格式不稳定。
     if (part.type === "toolCall") {
       if (typeof part.name === "string") text.push(part.name);
       const argumentsText = stringifyValue(part.arguments);
       if (argumentsText) text.push(argumentsText);
     }
 
-    // A custom message may expose a tool name without using pi-ai's exact
-    // ToolCall shape. Keep the projection permissive for future extensions.
+    // 自定义消息可能暴露 tool name，但不一定使用 pi-ai 的精确 ToolCall 结构。
+    // 这里保持投影逻辑足够宽松，方便未来扩展。
     if (part.type === "toolResult" && typeof part.toolName === "string") {
       text.push(part.toolName);
     }
@@ -93,7 +91,7 @@ function extractTimestamp(message: JsonRecord): number {
   return Date.now();
 }
 
-/** Return the text projection used by both FTS5 indexes. */
+/** 返回两个 FTS5 索引共同使用的文本投影。 */
 export function extractMessageText(message: AgentMessage): string | null {
   const record = asRecord(message);
   if (!record) return null;
@@ -104,7 +102,7 @@ export function extractMessageText(message: AgentMessage): string | null {
   return text.join("\n").trim() || null;
 }
 
-/** Convert an AgentMessage into the stable columns stored by SessionStore. */
+/** 将 AgentMessage 转换成 SessionStore 保存的稳定结构化字段。 */
 export function normalizeMessage(message: AgentMessage): NormalizedMessage {
   const record = asRecord(message);
   const role = record?.role;

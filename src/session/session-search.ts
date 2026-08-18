@@ -58,7 +58,7 @@ function countCjkCharacters(text: string): number {
   ).length;
 }
 
-/** Normalize and bound user-controlled search input before SQL is built. */
+/** 在拼接 SQL 之前，规范化并限制用户输入的搜索关键词长度。 */
 export function normalizeSearchQuery(query: string): string {
   const normalized = query.trim();
   if (normalized.length > MAX_SEARCH_QUERY_LENGTH) {
@@ -68,9 +68,8 @@ export function normalizeSearchQuery(query: string): string {
 }
 
 /**
- * Treat plain user input as an implicit AND query while quoting every token.
- * This prevents FTS5 operators and punctuation from changing the SQL search
- * grammar unexpectedly.
+ * 把普通用户输入处理成隐式 AND 查询，并为每个词加引号。
+ * 这样可以避免 FTS5 运算符和标点意外改变搜索语法。
  */
 export function toFtsQuery(query: string): string {
   return tokenizeQuery(query)
@@ -85,9 +84,9 @@ export function toLikeTerms(query: string): string[] {
 }
 
 /**
- * The built-in trigram tokenizer cannot match a two-character CJK token. Use
- * LIKE for those queries; use trigram only when every CJK token has at least
- * three characters, which keeps the route deterministic for mixed queries.
+ * 内置 trigram 分词器无法匹配只有两个字符的中日韩文字词语。
+ * 这类查询使用 LIKE；只有每个中日韩文字词语至少包含三个字符时才使用
+ * trigram，从而让混合语言查询的路由行为保持确定。
  */
 export function chooseSearchRoute(query: string): SearchRoute {
   const tokens = tokenizeQuery(query).map(removeWrappingQuotes).filter(Boolean);

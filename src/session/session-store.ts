@@ -48,10 +48,10 @@ export interface SessionRecord {
 }
 
 /**
- * Application-owned session boundary.
+ * 应用层的会话边界。
  *
- * The Agent and ChatService only see AgentMessage values. Database schema,
- * migrations, FTS triggers, and transaction handling stay behind this API.
+ * Agent 和 ChatService 只接触 AgentMessage，不需要了解数据库表结构、
+ * 数据迁移、FTS 触发器以及事务处理的具体细节。
  */
 export interface SessionStore {
   getOrCreate(
@@ -79,7 +79,7 @@ function isBusyError(error: unknown): boolean {
   return message.includes("database is locked") || message.includes("database is busy");
 }
 
-/** DatabaseSync is synchronous, so use a bounded blocking wait between retries. */
+/** DatabaseSync 是同步 API，因此在重试之间使用有上限的阻塞等待。 */
 function sleepSync(milliseconds: number): void {
   const signal = new Int32Array(new SharedArrayBuffer(4));
   Atomics.wait(signal, 0, 0, milliseconds);
@@ -197,8 +197,8 @@ export class InMemorySessionStore implements SessionStore {
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
-    // Keep the session row/metadata so a reset does not change the logical
-    // channel scope or future conversation lineage.
+    // 保留会话记录和元数据，避免重置后改变所属频道范围或后续会话的
+    // lineage（继承关系）。
     session.messages = [];
     session.record.messageCount = 0;
     session.record.updatedAt = Date.now();
@@ -236,11 +236,10 @@ type SearchRow = {
 };
 
 /**
- * SQLite-backed structured session storage.
+ * 基于 SQLite 的结构化会话存储。
  *
- * Node.js 22.19+ provides the built-in node:sqlite module, so this persistent
- * implementation does not add a native npm dependency. The messages table is
- * canonical; FTS5 tables are maintained as derived indexes by SQLite triggers.
+ * Node.js 22.19+ 内置 node:sqlite，因此不需要额外安装原生 npm 依赖。
+ * messages 表是唯一可信的数据来源；FTS5 表是由 SQLite 触发器维护的派生索引。
  */
 export class SqliteSessionStore implements SessionStore {
   private readonly database: DatabaseSync;
@@ -266,8 +265,8 @@ export class SqliteSessionStore implements SessionStore {
       `);
       initializeSessionSchema(this.database);
     } catch (error) {
-      // A failed schema initialization must not leak a live file descriptor,
-      // especially when the caller needs to remove a bad local database.
+      // Schema 初始化失败时必须关闭数据库文件描述符，尤其要保证调用方
+      // 可以顺利删除有问题的本地数据库。
       this.database.close();
       throw error;
     }
@@ -400,8 +399,8 @@ export class SqliteSessionStore implements SessionStore {
     const normalized = messages.map((message) => normalizeMessage(message));
 
     this.withWriteTransaction(() => {
-      // Keeping append self-contained makes the store safe for direct callers;
-      // the normal application path creates this row during startup.
+      // 让 append 自己确保会话存在，可以保证直接调用此方法时也安全；
+      // 正常的应用启动流程会更早创建这条会话记录。
       this.ensureSessionRow(sessionId);
       const nextSequenceRow = this.nextSequenceStatement.get(sessionId) as {
         next_sequence: number;
@@ -446,9 +445,8 @@ export class SqliteSessionStore implements SessionStore {
         offset,
       );
     } catch {
-      // FTS is a derived index. A damaged or unavailable index must not make
-      // historical messages undiscoverable; canonical content remains in
-      // messages and can be searched with the slower LIKE fallback.
+      // FTS 是派生索引。即使索引损坏或不可用，也不能让历史消息无法查找；
+      // 原始内容仍保存在 messages 表中，可以退回到速度较慢的 LIKE 搜索。
       return this.searchLike(terms, options, limit, offset);
     }
   }
@@ -458,8 +456,8 @@ export class SqliteSessionStore implements SessionStore {
       const session = this.getSessionStatement.get(sessionId);
       if (!session) return;
 
-      // DELETE fires both FTS delete triggers. The session metadata remains so
-      // reset preserves channel/user isolation and future lineage metadata.
+      // DELETE 会触发两个 FTS 删除触发器。保留会话元数据可以让重置操作
+      // 继续保持频道/用户隔离，并保留后续会话的 lineage 元数据。
       this.deleteMessagesStatement.run(sessionId);
       this.resetSessionStatement.run(Date.now(), sessionId);
     });
@@ -644,11 +642,10 @@ export class SqliteSessionStore implements SessionStore {
   }
 
   /**
-   * BEGIN IMMEDIATE obtains the SQLite write lock before any message row is
-   * changed. FTS trigger work and the session counter update therefore commit
-   * or roll back together with the canonical transcript. Short jittered
-   * retries handle another process briefly holding SQLite's single writer
-   * lock without turning normal contention into data loss.
+   * BEGIN IMMEDIATE 会在修改消息前先获取 SQLite 写锁。
+   * 因此 FTS 触发器操作、会话消息计数和消息正文会一起提交或回滚。
+   * 短暂的带延迟重试可以处理其他进程暂时占用 SQLite 单写入者锁的情况，
+   * 避免普通并发竞争造成数据丢失。
    */
   private withWriteTransaction<T>(operation: () => T): T {
     for (let attempt = 0; ; attempt += 1) {

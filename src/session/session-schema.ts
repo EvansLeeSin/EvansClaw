@@ -1,9 +1,9 @@
 import type { DatabaseSync } from "node:sqlite";
 
 /**
- * The schema version is intentionally separate from SQLite's user_version.
- * Each migration is recorded only after its transaction commits, so a failed
- * initialization can be retried without pretending that it succeeded.
+ * Schema 版本号与 SQLite 自带的 user_version 刻意分开保存。
+ * 只有迁移事务提交成功后才记录版本，因此初始化失败时可以安全重试，
+ * 不会把未完成的迁移误认为已经成功。
  */
 export const SESSION_SCHEMA_VERSION = 1;
 
@@ -134,9 +134,9 @@ const MIGRATIONS: readonly Migration[] = [
 ];
 
 /**
- * Reject the abandoned JSON-blob schema instead of silently opening it with
- * a different interpretation. EvansClaw is not deployed yet, so the caller
- * can remove the local database and let this schema initialize from scratch.
+ * 拒绝已经废弃的 JSON Blob 表结构，而不是用新的含义静默打开它。
+ * EvansClaw 当前还没有正式投入使用，因此调用方可以删除本地数据库，
+ * 让新结构从头初始化。
  */
 function assertNotLegacySchema(database: DatabaseSync): void {
   const table = database
@@ -175,7 +175,7 @@ function appliedVersions(database: DatabaseSync): Set<number> {
   return new Set(rows.map((row) => Number(row.version)));
 }
 
-/** Apply all known migrations, one transaction per migration. */
+/** 执行所有已知迁移；每个迁移单独使用一个事务。 */
 export function initializeSessionSchema(database: DatabaseSync): void {
   assertNotLegacySchema(database);
   ensureMigrationTable(database);

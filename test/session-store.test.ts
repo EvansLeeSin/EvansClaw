@@ -25,8 +25,8 @@ function userMessage(content: string, timestamp = Date.now()): AgentMessage {
 }
 
 function assistantMessage(content: string, timestamp = Date.now()): AgentMessage {
-  // The test only needs a replayable AgentMessage. Provider-specific fields
-  // are intentionally represented because raw_json must preserve them too.
+  // 测试只需要一条可以恢复的 AgentMessage；这里仍然保留 provider 相关字段，
+  // 用来验证 raw_json 会完整保存这些字段。
   return {
     role: "assistant",
     content: [{ type: "text", text: content }],

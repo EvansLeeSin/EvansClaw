@@ -14,8 +14,8 @@ const deepseekAnthropicModels: Model<"anthropic-messages">[] = Object.values(
   provider: DEEPSEEK_ANTHROPIC_PROVIDER_ID,
   baseUrl: DEEPSEEK_ANTHROPIC_BASE_URL,
   compat: {
-    // DeepSeek's Anthropic-compatible endpoint does not need Anthropic
-    // prompt-cache or fine-grained tool-streaming fields.
+    // DeepSeek 的 Anthropic 兼容接口不需要 Anthropic 的 prompt-cache
+    // 或细粒度工具流字段。
     supportsLongCacheRetention: false,
     supportsCacheControlOnTools: false,
     supportsEagerToolInputStreaming: false,
@@ -23,8 +23,8 @@ const deepseekAnthropicModels: Model<"anthropic-messages">[] = Object.values(
 }));
 
 export function deepseekAnthropicProvider() {
-  // Reuse pi-ai's official DeepSeek environment-key authentication
-  // (DEEPSEEK_API_KEY), but send requests through the Anthropic Messages API.
+  // 复用 pi-ai 官方的 DeepSeek 环境变量认证（DEEPSEEK_API_KEY），
+  // 但通过 Anthropic Messages API 发送请求。
   const deepseekAuth = deepseekProvider().auth;
 
   return createProvider({

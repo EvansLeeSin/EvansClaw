@@ -15,8 +15,8 @@ async function main(): Promise<void> {
 
   const sessionStore = new SqliteSessionStore(databasePath);
   try {
-    // Keep the existing personal session ID for CLI compatibility, while
-    // writing explicit channel/user metadata for future multi-channel use.
+    // 保留现有的 personal 会话 ID 以兼容 CLI，同时写入明确的频道/用户元数据，
+    // 为未来支持多个聊天频道做好准备。
     const session = await sessionStore.getOrCreate(sessionId, {
       conversationId: "personal",
       channel: "cli",
