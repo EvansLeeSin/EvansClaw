@@ -60,8 +60,8 @@ const MIGRATIONS: readonly Migration[] = [
         CREATE INDEX idx_messages_created_at
           ON messages(created_at);
 
-        -- External-content FTS keeps messages as the source of truth and does
-        -- not duplicate every message body inside the search table.
+        -- 外部内容 FTS 让 messages 表作为唯一可信来源，避免在搜索表中
+        -- 再复制一份每条消息的完整正文。
         CREATE VIRTUAL TABLE messages_fts USING fts5(
           content,
           content='messages',
@@ -94,9 +94,8 @@ const MIGRATIONS: readonly Migration[] = [
           VALUES (new.id, new.content);
         END;
 
-        -- The standard unicode61 tokenizer is not suitable for Chinese
-        -- substring searches. The trigram index is a second derived index;
-        -- the search layer will route short CJK queries to LIKE instead.
+        -- 标准 unicode61 分词器不适合中文子串搜索。trigram 索引是第二个派生索引；
+        -- 搜索层会把较短的中日韩文字查询路由到 LIKE。
         CREATE VIRTUAL TABLE messages_fts_trigram USING fts5(
           content,
           content='messages',
