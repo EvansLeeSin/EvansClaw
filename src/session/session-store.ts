@@ -47,6 +47,36 @@ export interface SessionRecord {
   messageCount: number;
 }
 
+export interface SessionCompactionInput {
+  summary: string;
+  /** 保留区第一条消息的 sequence，边界是包含式的。 */
+  firstKeptSequence: number;
+  /** 压缩发生前的上下文 Token 数。 */
+  tokensBefore: number;
+  /** Provider 返回的 usage；只保存可 JSON 序列化的数据。 */
+  usage?: unknown | null;
+  createdAt?: number;
+}
+
+export interface SessionCompaction {
+  id: number;
+  sessionId: string;
+  summary: string;
+  firstKeptSequence: number;
+  tokensBefore: number;
+  usage: unknown | null;
+  createdAt: number;
+}
+
+/**
+ * SQLite 永不删除 messages；当前 Agent 上下文由最新摘要和保留尾部组成。
+ * messages 仍可通过 load() 读取完整历史，loadContext() 只读取恢复当前上下文所需的尾部。
+ */
+export interface SessionContext {
+  compaction: SessionCompaction | null;
+  messages: AgentMessage[];
+}
+
 /**
  * 应用层的会话边界。
  *
@@ -59,6 +89,12 @@ export interface SessionStore {
     metadata?: SessionMetadata,
   ): Promise<SessionRecord>;
   load(sessionId: string): Promise<AgentMessage[]>;
+  loadContext(sessionId: string): Promise<SessionContext>;
+  getLatestCompaction(sessionId: string): Promise<SessionCompaction | null>;
+  appendCompaction(
+    sessionId: string,
+    compaction: SessionCompactionInput,
+  ): Promise<SessionCompaction>;
   append(sessionId: string, messages: AgentMessage[]): Promise<void>;
   search(
     query: string,
@@ -70,6 +106,7 @@ export interface SessionStore {
 type InMemorySession = {
   record: SessionRecord;
   messages: AgentMessage[];
+  compactions: SessionCompaction[];
 };
 
 const WRITE_RETRY_DELAYS_MS = [25, 50, 100, 200, 400] as const;
@@ -85,8 +122,75 @@ function sleepSync(milliseconds: number): void {
   Atomics.wait(signal, 0, 0, milliseconds);
 }
 
+type NormalizedCompaction = {
+  summary: string;
+  firstKeptSequence: number;
+  tokensBefore: number;
+  usageJson: string | null;
+  createdAt: number;
+};
+
+function normalizeCompaction(
+  compaction: SessionCompactionInput,
+): NormalizedCompaction {
+  const summary = compaction.summary.trim();
+  if (!summary) throw new Error("压缩摘要不能为空。");
+  if (
+    !Number.isInteger(compaction.firstKeptSequence) ||
+    compaction.firstKeptSequence < 0
+  ) {
+    throw new Error("压缩摘要的 firstKeptSequence 必须是非负整数。");
+  }
+  if (!Number.isInteger(compaction.tokensBefore) || compaction.tokensBefore < 0) {
+    throw new Error("压缩摘要的 tokensBefore 必须是非负整数。");
+  }
+
+  const createdAt = compaction.createdAt ?? Date.now();
+  if (!Number.isInteger(createdAt) || createdAt < 0) {
+    throw new Error("压缩摘要的 createdAt 必须是非负整数。");
+  }
+
+  let usageJson: string | null = null;
+  if (compaction.usage !== undefined && compaction.usage !== null) {
+    try {
+      usageJson = JSON.stringify(compaction.usage);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      throw new Error(`压缩摘要的 usage 无法序列化：${reason}`);
+    }
+    if (usageJson === undefined) {
+      throw new Error("压缩摘要的 usage 无法序列化。");
+    }
+  }
+
+  return {
+    summary,
+    firstKeptSequence: compaction.firstKeptSequence,
+    tokensBefore: compaction.tokensBefore,
+    usageJson,
+    createdAt,
+  };
+}
+
+function parseCompactionUsage(
+  sessionId: string,
+  compactionId: number,
+  usageJson: string | null,
+): unknown | null {
+  if (usageJson === null) return null;
+  try {
+    return JSON.parse(usageJson);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `会话 ${sessionId} 的压缩记录 ${compactionId} usage 无法解析：${reason}`,
+    );
+  }
+}
+
 export class InMemorySessionStore implements SessionStore {
   private readonly sessions = new Map<string, InMemorySession>();
+  private nextCompactionId = 1;
 
   async getOrCreate(
     sessionId: string,
@@ -108,12 +212,69 @@ export class InMemorySessionStore implements SessionStore {
       parentSessionId: metadata.parentSessionId ?? null,
       messageCount: 0,
     };
-    this.sessions.set(sessionId, { record, messages: [] });
+    this.sessions.set(sessionId, { record, messages: [], compactions: [] });
     return { ...record };
   }
 
   async load(sessionId: string): Promise<AgentMessage[]> {
     return [...(this.sessions.get(sessionId)?.messages ?? [])];
+  }
+
+  async loadContext(sessionId: string): Promise<SessionContext> {
+    const session = this.sessions.get(sessionId);
+    if (!session) return { compaction: null, messages: [] };
+
+    const compaction = session.compactions.at(-1) ?? null;
+    return {
+      compaction: compaction ? { ...compaction } : null,
+      messages: compaction
+        ? session.messages.slice(compaction.firstKeptSequence)
+        : [...session.messages],
+    };
+  }
+
+  async getLatestCompaction(
+    sessionId: string,
+  ): Promise<SessionCompaction | null> {
+    const compaction = this.sessions.get(sessionId)?.compactions.at(-1);
+    return compaction ? { ...compaction } : null;
+  }
+
+  async appendCompaction(
+    sessionId: string,
+    compaction: SessionCompactionInput,
+  ): Promise<SessionCompaction> {
+    const normalized = normalizeCompaction(compaction);
+    let session = this.sessions.get(sessionId);
+    if (!session) {
+      await this.getOrCreate(sessionId);
+      session = this.sessions.get(sessionId);
+    }
+    if (!session) throw new Error(`会话 ${sessionId} 不存在。`);
+    if (normalized.firstKeptSequence > session.record.messageCount) {
+      throw new Error(
+        `压缩摘要的 firstKeptSequence ${normalized.firstKeptSequence} 超过会话 ${sessionId} 的消息数量 ${session.record.messageCount}。`,
+      );
+    }
+
+    const record: SessionCompaction = {
+      id: this.nextCompactionId++,
+      sessionId,
+      summary: normalized.summary,
+      firstKeptSequence: normalized.firstKeptSequence,
+      tokensBefore: normalized.tokensBefore,
+      usage:
+        normalized.usageJson === null
+          ? null
+          : JSON.parse(normalized.usageJson),
+      createdAt: normalized.createdAt,
+    };
+    session.compactions.push(record);
+    session.record.updatedAt = Math.max(
+      session.record.updatedAt,
+      normalized.createdAt,
+    );
+    return { ...record };
   }
 
   async append(sessionId: string, messages: AgentMessage[]): Promise<void> {
@@ -198,8 +359,9 @@ export class InMemorySessionStore implements SessionStore {
     if (!session) return;
 
     // 保留会话记录和元数据，避免重置后改变所属频道范围或后续会话的
-    // lineage（继承关系）。
+    // lineage（继承关系）。摘要是消息的派生视图，因此也必须一起清理。
     session.messages = [];
+    session.compactions = [];
     session.record.messageCount = 0;
     session.record.updatedAt = Date.now();
   }
@@ -220,6 +382,16 @@ type SessionRow = {
 
 type MessageRow = {
   raw_json: string;
+};
+
+type CompactionRow = {
+  id: number;
+  session_id: string;
+  summary: string;
+  first_kept_sequence: number;
+  tokens_before: number;
+  usage_json: string | null;
+  created_at: number;
 };
 
 type SearchRow = {
@@ -247,6 +419,11 @@ export class SqliteSessionStore implements SessionStore {
   private readonly insertSessionStatement: StatementSync;
   private readonly updateSessionMetadataStatement: StatementSync;
   private readonly loadMessagesStatement: StatementSync;
+  private readonly loadContextMessagesStatement: StatementSync;
+  private readonly latestCompactionStatement: StatementSync;
+  private readonly insertCompactionStatement: StatementSync;
+  private readonly deleteCompactionsStatement: StatementSync;
+  private readonly touchSessionStatement: StatementSync;
   private readonly nextSequenceStatement: StatementSync;
   private readonly insertMessageStatement: StatementSync;
   private readonly deleteMessagesStatement: StatementSync;
@@ -314,6 +491,42 @@ export class SqliteSessionStore implements SessionStore {
       WHERE session_id = ?
       ORDER BY sequence ASC
     `);
+    this.loadContextMessagesStatement = this.database.prepare(`
+      SELECT raw_json
+      FROM messages
+      WHERE session_id = ? AND sequence >= ?
+      ORDER BY sequence ASC
+    `);
+    this.latestCompactionStatement = this.database.prepare(`
+      SELECT
+        id,
+        session_id,
+        summary,
+        first_kept_sequence,
+        tokens_before,
+        usage_json,
+        created_at
+      FROM session_compactions
+      WHERE session_id = ?
+      ORDER BY id DESC
+      LIMIT 1
+    `);
+    this.insertCompactionStatement = this.database.prepare(`
+      INSERT INTO session_compactions (
+        session_id,
+        summary,
+        first_kept_sequence,
+        tokens_before,
+        usage_json,
+        created_at
+      ) VALUES (?, ?, ?, ?, ?, ?)
+    `);
+    this.deleteCompactionsStatement = this.database.prepare(
+      "DELETE FROM session_compactions WHERE session_id = ?",
+    );
+    this.touchSessionStatement = this.database.prepare(
+      "UPDATE sessions SET updated_at = MAX(updated_at, ?) WHERE id = ?",
+    );
     this.nextSequenceStatement = this.database.prepare(`
       SELECT COALESCE(MAX(sequence) + 1, 0) AS next_sequence
       FROM messages
@@ -369,28 +582,69 @@ export class SqliteSessionStore implements SessionStore {
 
   async load(sessionId: string): Promise<AgentMessage[]> {
     const rows = this.loadMessagesStatement.all(sessionId) as unknown as MessageRow[];
-    return rows.map((row, index) => {
-      let message: unknown;
-      try {
-        message = JSON.parse(row.raw_json);
-      } catch (error) {
-        const reason = error instanceof Error ? error.message : String(error);
+    return this.parseMessages(sessionId, rows);
+  }
+
+  async loadContext(sessionId: string): Promise<SessionContext> {
+    const compactionRow = this.latestCompactionStatement.get(sessionId) as
+      | CompactionRow
+      | undefined;
+    if (!compactionRow) {
+      return { compaction: null, messages: await this.load(sessionId) };
+    }
+
+    const compaction = this.toSessionCompaction(compactionRow);
+    const rows = this.loadContextMessagesStatement.all(
+      sessionId,
+      compaction.firstKeptSequence,
+    ) as unknown as MessageRow[];
+    return {
+      compaction,
+      messages: this.parseMessages(sessionId, rows),
+    };
+  }
+
+  async getLatestCompaction(
+    sessionId: string,
+  ): Promise<SessionCompaction | null> {
+    const row = this.latestCompactionStatement.get(sessionId) as
+      | CompactionRow
+      | undefined;
+    return row ? this.toSessionCompaction(row) : null;
+  }
+
+  async appendCompaction(
+    sessionId: string,
+    compaction: SessionCompactionInput,
+  ): Promise<SessionCompaction> {
+    const normalized = normalizeCompaction(compaction);
+
+    return this.withWriteTransaction(() => {
+      const session = this.getSessionStatement.get(sessionId) as
+        | SessionRow
+        | undefined;
+      if (!session) throw new Error(`会话 ${sessionId} 不存在。`);
+      if (normalized.firstKeptSequence > Number(session.message_count)) {
         throw new Error(
-          `会话 ${sessionId} 的第 ${index + 1} 条消息无法解析：${reason}`,
+          `压缩摘要的 firstKeptSequence ${normalized.firstKeptSequence} 超过会话 ${sessionId} 的消息数量 ${session.message_count}。`,
         );
       }
 
-      if (
-        typeof message !== "object" ||
-        message === null ||
-        typeof (message as { role?: unknown }).role !== "string"
-      ) {
-        throw new Error(
-          `会话 ${sessionId} 的第 ${index + 1} 条消息格式无效。`,
-        );
-      }
+      this.insertCompactionStatement.run(
+        sessionId,
+        normalized.summary,
+        normalized.firstKeptSequence,
+        normalized.tokensBefore,
+        normalized.usageJson,
+        normalized.createdAt,
+      );
+      this.touchSessionStatement.run(normalized.createdAt, sessionId);
 
-      return message as AgentMessage;
+      const row = this.latestCompactionStatement.get(sessionId) as
+        | CompactionRow
+        | undefined;
+      if (!row) throw new Error(`无法读取会话 ${sessionId} 的压缩记录。`);
+      return this.toSessionCompaction(row);
     });
   }
 
@@ -456,8 +710,9 @@ export class SqliteSessionStore implements SessionStore {
       const session = this.getSessionStatement.get(sessionId);
       if (!session) return;
 
-      // DELETE 会触发两个 FTS 删除触发器。保留会话元数据可以让重置操作
-      // 继续保持频道/用户隔离，并保留后续会话的 lineage 元数据。
+      // DELETE 会触发两个 FTS 删除触发器。摘要是 messages 的派生视图，
+      // 因此必须和消息一起清理；会话元数据仍然保留。
+      this.deleteCompactionsStatement.run(sessionId);
       this.deleteMessagesStatement.run(sessionId);
       this.resetSessionStatement.run(Date.now(), sessionId);
     });
@@ -499,6 +754,48 @@ export class SqliteSessionStore implements SessionStore {
       message.tokenCount,
       message.createdAt,
     );
+  }
+
+  private parseMessages(
+    sessionId: string,
+    rows: MessageRow[],
+  ): AgentMessage[] {
+    return rows.map((row, index) => {
+      let message: unknown;
+      try {
+        message = JSON.parse(row.raw_json);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        throw new Error(
+          `会话 ${sessionId} 的第 ${index + 1} 条消息无法解析：${reason}`,
+        );
+      }
+
+      if (
+        typeof message !== "object" ||
+        message === null ||
+        typeof (message as { role?: unknown }).role !== "string"
+      ) {
+        throw new Error(
+          `会话 ${sessionId} 的第 ${index + 1} 条消息格式无效。`,
+        );
+      }
+
+      return message as AgentMessage;
+    });
+  }
+
+  private toSessionCompaction(row: CompactionRow): SessionCompaction {
+    const id = Number(row.id);
+    return {
+      id,
+      sessionId: row.session_id,
+      summary: row.summary,
+      firstKeptSequence: Number(row.first_kept_sequence),
+      tokensBefore: Number(row.tokens_before),
+      usage: parseCompactionUsage(row.session_id, id, row.usage_json),
+      createdAt: Number(row.created_at),
+    };
   }
 
   private toSessionRecord(row: SessionRow): SessionRecord {

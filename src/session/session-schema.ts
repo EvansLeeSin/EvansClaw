@@ -5,7 +5,7 @@ import type { DatabaseSync } from "node:sqlite";
  * 只有迁移事务提交成功后才记录版本，因此初始化失败时可以安全重试，
  * 不会把未完成的迁移误认为已经成功。
  */
-export const SESSION_SCHEMA_VERSION = 1;
+export const SESSION_SCHEMA_VERSION = 2;
 
 type Migration = {
   version: number;
@@ -127,6 +127,28 @@ const MIGRATIONS: readonly Migration[] = [
           INSERT INTO messages_fts_trigram(rowid, content)
           VALUES (new.id, new.content);
         END;
+      `);
+    },
+  },
+  {
+    version: 2,
+    up(database) {
+      database.exec(`
+        CREATE TABLE session_compactions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          session_id TEXT NOT NULL
+            REFERENCES sessions(id)
+            ON DELETE CASCADE,
+          summary TEXT NOT NULL,
+          -- 这是保留区第一条消息的 sequence，边界是包含式的。
+          first_kept_sequence INTEGER NOT NULL CHECK (first_kept_sequence >= 0),
+          tokens_before INTEGER NOT NULL CHECK (tokens_before >= 0),
+          usage_json TEXT,
+          created_at INTEGER NOT NULL
+        );
+
+        CREATE INDEX idx_session_compactions_latest
+          ON session_compactions(session_id, id DESC);
       `);
     },
   },

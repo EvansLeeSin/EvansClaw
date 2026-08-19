@@ -66,14 +66,15 @@ test("initializes the structured schema and records migration version", () => {
         "messages",
         "messages_fts",
         "messages_fts_trigram",
+        "session_compactions",
       ].every((name) => names.has(name)),
       true,
     );
     assert.equal(
-      (database.prepare("SELECT version FROM schema_migrations").get() as {
-        version: number;
-      }).version,
-      1,
+      (database
+        .prepare("SELECT MAX(version) AS version FROM schema_migrations")
+        .get() as { version: number }).version,
+      2,
     );
 
     const columns = database
@@ -84,6 +85,43 @@ test("initializes the structured schema and records migration version", () => {
     assert.equal(columnNames.has("sequence"), true);
     assert.equal(columnNames.has("messages_json"), false);
     database.close();
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("将已有 schema v1 数据库升级到 schema v2", () => {
+  const fixture = createDatabaseFixture();
+  try {
+    const firstStore = new SqliteSessionStore(fixture.path);
+    firstStore.close();
+
+    const database = new DatabaseSync(fixture.path);
+    database.exec(`
+      DROP TABLE session_compactions;
+      DELETE FROM schema_migrations WHERE version = 2;
+    `);
+    database.close();
+
+    const upgradedStore = new SqliteSessionStore(fixture.path);
+    upgradedStore.close();
+
+    const upgradedDatabase = new DatabaseSync(fixture.path);
+    assert.equal(
+      (upgradedDatabase
+        .prepare("SELECT MAX(version) AS version FROM schema_migrations")
+        .get() as { version: number }).version,
+      2,
+    );
+    assert.equal(
+      (upgradedDatabase
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_compactions'",
+        )
+        .get() as { name: string } | undefined)?.name,
+      "session_compactions",
+    );
+    upgradedDatabase.close();
   } finally {
     fixture.cleanup();
   }
@@ -110,6 +148,126 @@ test("appends AgentMessages and recovers them after a database restart", async (
     const restored = await secondStore.load("personal");
     assert.deepEqual(restored, original);
     secondStore.close();
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("persists the latest compaction and restores only its retained tail after restart", async () => {
+  const fixture = createDatabaseFixture();
+  try {
+    const original = [
+      userMessage("第一轮任务", 1000),
+      assistantMessage("第一轮回答", 2000),
+      userMessage("第二轮任务", 3000),
+      assistantMessage("第二轮回答", 4000),
+    ];
+
+    const firstStore = new SqliteSessionStore(fixture.path);
+    await firstStore.getOrCreate("personal");
+    await firstStore.append("personal", original);
+
+    const saved = await firstStore.appendCompaction("personal", {
+      summary: "## Goal\n保留第二轮任务",
+      firstKeptSequence: 2,
+      tokensBefore: 1234,
+      usage: { input: 1000, output: 234, totalTokens: 1234 },
+      createdAt: 5000,
+    });
+    assert.equal(saved.id, 1);
+    assert.equal(saved.firstKeptSequence, 2);
+    assert.deepEqual(saved.usage, {
+      input: 1000,
+      output: 234,
+      totalTokens: 1234,
+    });
+    assert.deepEqual(await firstStore.load("personal"), original);
+
+    const current = await firstStore.loadContext("personal");
+    assert.equal(current.compaction?.summary, "## Goal\n保留第二轮任务");
+    assert.deepEqual(current.messages, original.slice(2));
+    firstStore.close();
+
+    const secondStore = new SqliteSessionStore(fixture.path);
+    const restored = await secondStore.loadContext("personal");
+    assert.equal(restored.compaction?.firstKeptSequence, 2);
+    assert.equal(restored.compaction?.tokensBefore, 1234);
+    assert.deepEqual(restored.compaction?.usage, {
+      input: 1000,
+      output: 234,
+      totalTokens: 1234,
+    });
+    assert.deepEqual(restored.messages, original.slice(2));
+    assert.equal((await secondStore.getLatestCompaction("personal"))?.id, 1);
+    secondStore.close();
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("只使用同一会话的最新压缩记录，并保留完整 messages 历史", async () => {
+  const fixture = createDatabaseFixture();
+  try {
+    const store = new SqliteSessionStore(fixture.path);
+    await store.getOrCreate("personal");
+    await store.append("personal", [
+      userMessage("零", 1000),
+      assistantMessage("一", 2000),
+      userMessage("二", 3000),
+      assistantMessage("三", 4000),
+    ]);
+
+    await store.appendCompaction("personal", {
+      summary: "旧摘要",
+      firstKeptSequence: 1,
+      tokensBefore: 100,
+    });
+    const latest = await store.appendCompaction("personal", {
+      summary: "新摘要",
+      firstKeptSequence: 3,
+      tokensBefore: 200,
+    });
+
+    const context = await store.loadContext("personal");
+    assert.equal(context.compaction?.id, latest.id);
+    assert.equal(context.compaction?.summary, "新摘要");
+    assert.equal(context.messages.length, 1);
+    assert.deepEqual(context.messages, (await store.load("personal")).slice(3));
+    assert.equal((await store.getOrCreate("personal")).messageCount, 4);
+    store.close();
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("拒绝越过消息数量的压缩切点，并在清理会话时删除压缩记录", async () => {
+  const fixture = createDatabaseFixture();
+  try {
+    const store = new SqliteSessionStore(fixture.path);
+    await store.getOrCreate("personal");
+    await store.append("personal", [userMessage("只存在一条消息")]);
+
+    await assert.rejects(
+      store.appendCompaction("personal", {
+        summary: "非法切点",
+        firstKeptSequence: 2,
+        tokensBefore: 10,
+      }),
+      /超过会话 personal 的消息数量 1/,
+    );
+
+    await store.appendCompaction("personal", {
+      summary: "合法摘要",
+      firstKeptSequence: 1,
+      tokensBefore: 10,
+    });
+    await store.clear("personal");
+    assert.equal(await store.getLatestCompaction("personal"), null);
+    assert.deepEqual(await store.loadContext("personal"), {
+      compaction: null,
+      messages: [],
+    });
+    store.close();
   } finally {
     fixture.cleanup();
   }
