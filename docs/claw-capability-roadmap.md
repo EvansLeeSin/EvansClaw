@@ -69,7 +69,7 @@ CLI / Telegram / 飞书 / Web / Cron
 | 顺序 | 模块 | 主要依赖 | 优先级 | 状态 |
 |---|---|---|---|---|
 | 1 | SQLite 会话 + 全文搜索 | 当前 SessionStore | 高 | 已完成 |
-| 2 | Context 压缩 | 会话结构化存储、模型调用 | 高 | 待实现 |
+| 2 | Context 压缩 | 会话结构化存储、模型调用 | 高 | 已完成基础实现 |
 | 3 | Skills 按需加载 | Prompt 构造、文件读取 | 中 | 待实现 |
 | 4 | Tool Registry | Agent Tool API | 高 | 待实现 |
 | 5 | Tool Policy 和人工确认 | Tool Registry、身份上下文 | 高 | 待实现 |
@@ -224,22 +224,31 @@ interface SessionStore {
 - 未完成的工具调用及结果
 - 已确认的重要事实
 
-### 关键设计
+### 实际实现
 
-- 压缩前估算 token 数量。
-- 触发阈值应可配置，例如上下文达到 70% 或 80%。
-- 摘要应作为明确的 `summary` 消息或内部上下文层保存。
-- 原始历史不能立即删除，应保留在 SQLite 中，便于审计和重新压缩。
-- 压缩失败时，优先裁剪低价值历史，不应导致整个请求失败。
-- 摘要模型可以和主模型不同，但必须有超时和失败回退策略。
+- `src/context/token-estimator.ts` 使用 Provider usage 优先、字符数回退的方式估算上下文 Token。
+- `src/context/cut-point.ts` 从尾部寻找安全切点，避免把 `toolCall` 和 `toolResult` 拆开。
+- `src/context/context-summarizer.ts` 负责会话序列化、结构化摘要 Prompt、超时、取消和 Provider 错误分类。
+- `src/context/context-manager.ts` 在每次 prompt 前判断是否需要压缩，生成滚动摘要，并构造 Pi 的 `compactionSummary` 消息。
+- `ChatService` 先把压缩记录写入 SQLite，再替换 Agent 内存上下文；持久化游标同步到压缩后的可见数组长度。
+- `main.ts` 启动时通过 `loadContext()` 恢复最新摘要和保留尾部。
+- `session_compactions` 保存摘要、保留起点、压缩前 Token 数和摘要模型 usage；`messages` 原始历史永不删除。
+- 默认预留 `16,384` Token，压缩后保留约 `20,000` Token 的最近消息；模型上下文窗口为 0 时不自动压缩。
 
-### 验收标准
+### 验收结果
 
-- 长对话不会因为超过上下文窗口而直接失败。
-- 压缩后 Agent 仍能回答近期任务相关问题。
-- tool call/result 不会被拆开。
-- 原始消息仍可通过会话搜索获取。
-- 压缩过程有日志和可测试的触发条件。
+- [x] 上下文达到模型窗口预留阈值时会自动触发压缩。
+- [x] 压缩后 Agent 使用“摘要 + 最近消息 + 当前问题”继续对话。
+- [x] `toolCall`/`toolResult` 不会在安全切点上被拆开。
+- [x] 原始消息仍可通过 `SessionStore.load()` 和搜索 API 获取。
+- [x] 摘要和保留起点写入 SQLite，重启后可以恢复并继续滚动压缩。
+- [x] 摘要失败时不修改内存上下文、不写入压缩记录，当前请求继续使用原上下文。
+- [x] 已添加自动压缩、游标、重启恢复、SQLite 持久化和失败处理测试。
+
+### 当前限制
+
+- 没有可安全压缩的单条超大消息时，本阶段不会强行删除它；单轮拆分降级留待后续优化。
+- 当前没有单独的压缩日志事件和低价值历史裁剪器。
 
 ---
 

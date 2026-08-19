@@ -1,9 +1,16 @@
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import { resolve } from "node:path";
-import { assertConfig, config } from "./config.js";
-import { createAgent } from "./agent/create-agent.js";
+import {
+  createAgent,
+  createContextSummarizer,
+} from "./agent/create-agent.js";
 import { ChatService } from "./chat/chat-service.js";
+import { assertConfig, config } from "./config.js";
+import {
+  ContextManager,
+  restoreContextMessages,
+} from "./context/context-manager.js";
 import { SqliteSessionStore } from "./session/session-store.js";
 
 const sessionId = "personal";
@@ -23,8 +30,12 @@ async function main(): Promise<void> {
       userId: "local",
       model: config.model,
     });
-    const agent = createAgent(await sessionStore.load(session.id));
-    const chat = new ChatService(agent, sessionStore, session.id);
+    const persistedContext = await sessionStore.loadContext(session.id);
+    const agent = createAgent(restoreContextMessages(persistedContext));
+    const chat = new ChatService(agent, sessionStore, session.id, {
+      contextManager: new ContextManager(createContextSummarizer()),
+      initialCompaction: persistedContext.compaction,
+    });
     const readline = createInterface({ input, output });
 
     console.log("EvansClaw 最小聊天 Agent");

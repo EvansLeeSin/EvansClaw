@@ -13,7 +13,10 @@
 - 按轮次批量追加消息，保留完整 `AgentMessage` JSON
 - FTS5 全文搜索、中文 trigram 搜索与 LIKE 兜底
 - 应用层 `SessionStore` 抽象
-- 后续可扩展的 `ChatService` 边界
+- 基于 Token 估算和安全切点的自动 Context 压缩
+- 使用 `session_compactions` 保存摘要并在重启后恢复
+- 摘要失败时保留原上下文，不删除原始历史
+- 可扩展的 `ChatService` 业务边界
 
 DeepSeek 请求地址：
 
@@ -72,7 +75,7 @@ export EVANSCLAW_MODEL="deepseek-v4-pro"
 2. 增加 Telegram 或飞书 Channel Adapter
 3. 以 `AgentTool` 形式逐个增加只读工具
 4. 为写入、发送、删除类工具增加权限确认
-5. 增加 Context 压缩、长期记忆、定时任务和事件触发
+5. 增加长期记忆、定时任务和事件触发
 
 会话数据库默认保存到：
 
