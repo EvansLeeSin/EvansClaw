@@ -1,6 +1,7 @@
 import type { Agent } from "@earendil-works/pi-agent-core";
 import { ContextManager } from "../context/context-manager.js";
 import type { SessionCompaction, SessionStore } from "../session/session-store.js";
+import type { SkillPromptBuilder } from "../skills/skill-prompt.js";
 
 export type TextDeltaHandler = (text: string) => void;
 
@@ -9,6 +10,8 @@ export interface ChatServiceOptions {
   contextManager?: ContextManager;
   /** 启动时从 SessionStore 恢复的最新压缩记录。 */
   initialCompaction?: SessionCompaction | null;
+  /** 每轮只把匹配到的 Skill 正文加入当前系统提示词。 */
+  skillPromptBuilder?: SkillPromptBuilder;
 }
 
 /**
@@ -24,6 +27,7 @@ export class ChatService {
   private persistedMessageCount: number;
   private currentCompaction: SessionCompaction | null;
   private readonly contextManager?: ContextManager;
+  private readonly skillPromptBuilder?: SkillPromptBuilder;
 
   constructor(
     private readonly agent: Agent,
@@ -37,31 +41,44 @@ export class ChatService {
     this.persistedMessageCount = agent.state.messages.length;
     this.currentCompaction = options.initialCompaction ?? null;
     this.contextManager = options.contextManager;
+    this.skillPromptBuilder = options.skillPromptBuilder;
   }
 
   async send(text: string, onTextDelta: TextDeltaHandler): Promise<void> {
-    // 在 Agent 自动追加本轮 user 消息之前压缩，保证摘要请求本身不会把当前问题
-    // 混入旧历史，同时让随后 prompt 直接使用“摘要 + 最近消息 + 当前问题”。
-    await this.prepareContext();
-
-    const unsubscribe = this.agent.subscribe((event) => {
-      if (
-        event.type === "message_update" &&
-        event.assistantMessageEvent.type === "text_delta"
-      ) {
-        onTextDelta(event.assistantMessageEvent.delta);
-      }
-    });
-
+    // Skill 正文只在当前 turn 加入 system prompt，避免把所有流程知识永久
+    // 留在 Agent 状态中；Skill 目录元数据由启动时的基础 prompt 保留。
+    const previousSystemPrompt = this.agent.state.systemPrompt;
     try {
-      await this.agent.prompt(text);
+      if (this.skillPromptBuilder) {
+        this.agent.state.systemPrompt =
+          await this.skillPromptBuilder.buildForTurn(text);
+      }
 
-      if (this.agent.state.errorMessage) {
-        throw new Error(this.agent.state.errorMessage);
+      // 在 Agent 自动追加本轮 user 消息之前压缩，保证摘要请求本身不会把当前问题
+      // 混入旧历史，同时让随后 prompt 直接使用“摘要 + 最近消息 + 当前问题”。
+      await this.prepareContext();
+
+      const unsubscribe = this.agent.subscribe((event) => {
+        if (
+          event.type === "message_update" &&
+          event.assistantMessageEvent.type === "text_delta"
+        ) {
+          onTextDelta(event.assistantMessageEvent.delta);
+        }
+      });
+
+      try {
+        await this.agent.prompt(text);
+
+        if (this.agent.state.errorMessage) {
+          throw new Error(this.agent.state.errorMessage);
+        }
+      } finally {
+        unsubscribe();
+        await this.persistNewMessages();
       }
     } finally {
-      unsubscribe();
-      await this.persistNewMessages();
+      this.agent.state.systemPrompt = previousSystemPrompt;
     }
   }
 

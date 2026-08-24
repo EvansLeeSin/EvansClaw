@@ -2,6 +2,8 @@ import {
   Agent,
   convertToLlm as convertAgentMessagesToLlm,
   type AgentMessage,
+  type AgentTool,
+  type ToolExecutionMode,
 } from "@earendil-works/pi-agent-core";
 import { createModels, type Api, type Model } from "@earendil-works/pi-ai";
 import {
@@ -30,14 +32,25 @@ const model: Model<Api> = (() => {
   return selected;
 })();
 
-export function createAgent(messages: AgentMessage[] = []): Agent {
+export interface CreateAgentOptions {
+  systemPrompt?: string;
+  tools?: AgentTool[];
+  /** Tool calls are sequential by default until read-only parallelism is proven. */
+  toolExecution?: ToolExecutionMode;
+}
+
+export function createAgent(
+  messages: AgentMessage[] = [],
+  options: CreateAgentOptions = {},
+): Agent {
   return new Agent({
     initialState: {
-      systemPrompt: config.systemPrompt,
+      systemPrompt: options.systemPrompt ?? config.systemPrompt,
       model,
-      tools: [],
+      tools: options.tools ?? [],
       messages,
     },
+    toolExecution: options.toolExecution ?? "sequential",
     // pi 的默认转换器会过滤 compactionSummary；使用官方 harness 转换器，
     // 让摘要在发给模型时变成带 <summary> 边界的 user 文本。
     convertToLlm: convertAgentMessagesToLlm,

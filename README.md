@@ -16,6 +16,11 @@
 - 基于 Token 估算和安全切点的自动 Context 压缩
 - 使用 `session_compactions` 保存摘要并在重启后恢复
 - 摘要失败时保留原上下文，不删除原始历史
+- `SKILL.md` 格式的 Skills Registry 和 YAML frontmatter 校验
+- Skills 元数据渐进式披露、显式/描述匹配和按需加载
+- Tool Registry：工具注册、筛选、TypeBox 参数校验、超时和取消
+- 只读 `load_skill`、`search_session`、`current_time` 工具（不会执行 Skill 目录中的脚本）
+- SQLite `tool_calls` 工具调用审计
 - 可扩展的 `ChatService` 业务边界
 
 DeepSeek 请求地址：
@@ -69,13 +74,25 @@ export EVANSCLAW_MODEL="deepseek-v4-pro"
 - `/reset`：清空当前会话
 - `/exit`：退出
 
+## Skills
+
+把 Skill 放到以下目录之一：
+
+```text
+skills/<skill-name>/SKILL.md
+.agents/skills/<skill-name>/SKILL.md
+```
+
+启动时只读取 Skill 的元数据；模型或用户请求需要时才加载完整正文。用户可以在请求中使用 `/skill-name` 或 `$skill-name` 显式激活 Skill。格式和示例见 [`skills/README.md`](skills/README.md)。
+
+当前不会执行 Skill 目录中的脚本，也不会因为 Skill 的 `allowed-tools` 声明自动授予工具权限。
+
 ## 后续设计方向
 
-1. 为每个外部聊天会话维护独立 Agent
-2. 增加 Telegram 或飞书 Channel Adapter
-3. 以 `AgentTool` 形式逐个增加只读工具
-4. 为写入、发送、删除类工具增加权限确认
-5. 增加长期记忆、定时任务和事件触发
+1. 为写入、发送、删除类工具增加 Tool Policy 和人工确认
+2. 为每个外部聊天会话维护独立 Agent
+3. 增加 Telegram 或飞书 Channel Adapter
+4. 增加长期记忆、定时任务和事件触发
 
 会话数据库默认保存到：
 
@@ -83,4 +100,4 @@ export EVANSCLAW_MODEL="deepseek-v4-pro"
 data/evansclaw.sqlite
 ```
 
-当前版本没有启用任何工具，也不会执行文件或 Shell 操作。
+当前版本没有启用副作用工具；只注册 `load_skill`、`search_session` 和 `current_time` 三个只读工具，不会执行文件、Shell、网络发送或其他写入操作。工具调用审计保存在会话数据库的 `tool_calls` 表中。

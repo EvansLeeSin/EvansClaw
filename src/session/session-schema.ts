@@ -5,7 +5,7 @@ import type { DatabaseSync } from "node:sqlite";
  * 只有迁移事务提交成功后才记录版本，因此初始化失败时可以安全重试，
  * 不会把未完成的迁移误认为已经成功。
  */
-export const SESSION_SCHEMA_VERSION = 2;
+export const SESSION_SCHEMA_VERSION = 3;
 
 type Migration = {
   version: number;
@@ -149,6 +149,49 @@ const MIGRATIONS: readonly Migration[] = [
 
         CREATE INDEX idx_session_compactions_latest
           ON session_compactions(session_id, id DESC);
+      `);
+    },
+  },
+  {
+    version: 3,
+    up(database) {
+      database.exec(`
+        -- 工具审计与消息历史分开保存，但仍绑定到 sessions，便于按用户、
+        -- 会话和渠道恢复一次工具调用的完整生命周期。
+        CREATE TABLE tool_calls (
+          id TEXT PRIMARY KEY,
+          request_id TEXT NOT NULL,
+          tool_call_id TEXT NOT NULL,
+          tool_name TEXT NOT NULL,
+          toolset TEXT NOT NULL,
+          risk TEXT NOT NULL CHECK (
+            risk IN ('read', 'write', 'external', 'destructive')
+          ),
+          session_id TEXT NOT NULL
+            REFERENCES sessions(id)
+            ON DELETE CASCADE,
+          conversation_id TEXT NOT NULL,
+          channel TEXT NOT NULL,
+          user_id TEXT NOT NULL,
+          args_hash TEXT NOT NULL,
+          args_json TEXT,
+          status TEXT NOT NULL CHECK (
+            status IN ('started', 'succeeded', 'failed')
+          ),
+          error_message TEXT,
+          result_metadata_json TEXT,
+          started_at INTEGER NOT NULL,
+          finished_at INTEGER
+        );
+
+        CREATE INDEX idx_tool_calls_session_started
+          ON tool_calls(session_id, started_at DESC);
+
+        CREATE INDEX idx_tool_calls_scope_started
+          ON tool_calls(user_id, channel, conversation_id, started_at DESC);
+
+        CREATE INDEX idx_tool_calls_request
+          ON tool_calls(request_id, tool_call_id);
       `);
     },
   },

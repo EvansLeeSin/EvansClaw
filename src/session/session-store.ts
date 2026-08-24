@@ -6,6 +6,17 @@ import {
 } from "node:sqlite";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
+  InMemoryToolAuditStore,
+  normalizeAuditLimit,
+  parseAuditMetadata,
+  serializeAuditMetadata,
+  type ToolAuditFinish,
+  type ToolAuditListOptions,
+  type ToolAuditRecord,
+  type ToolAuditStart,
+  type ToolAuditStore,
+} from "../tools/tool-audit.js";
+import {
   initializeSessionSchema,
 } from "./session-schema.js";
 import {
@@ -188,8 +199,9 @@ function parseCompactionUsage(
   }
 }
 
-export class InMemorySessionStore implements SessionStore {
+export class InMemorySessionStore implements SessionStore, ToolAuditStore {
   private readonly sessions = new Map<string, InMemorySession>();
+  private readonly toolAuditStore = new InMemoryToolAuditStore();
   private nextCompactionId = 1;
 
   async getOrCreate(
@@ -289,6 +301,26 @@ export class InMemorySessionStore implements SessionStore {
     current.messages.push(...messages);
     current.record.messageCount = current.messages.length;
     current.record.updatedAt = Date.now();
+  }
+
+  async startToolCall(record: ToolAuditStart): Promise<void> {
+    if (!this.sessions.has(record.sessionId)) {
+      throw new Error(`会话 ${record.sessionId} 不存在。`);
+    }
+    await this.toolAuditStore.startToolCall(record);
+  }
+
+  async finishToolCall(
+    auditId: string,
+    update: ToolAuditFinish,
+  ): Promise<void> {
+    await this.toolAuditStore.finishToolCall(auditId, update);
+  }
+
+  async listToolCalls(
+    options: ToolAuditListOptions = {},
+  ): Promise<ToolAuditRecord[]> {
+    return this.toolAuditStore.listToolCalls(options);
   }
 
   async search(
@@ -407,13 +439,33 @@ type SearchRow = {
   created_at: number;
 };
 
+type ToolCallRow = {
+  id: string;
+  request_id: string;
+  tool_call_id: string;
+  tool_name: string;
+  toolset: string;
+  risk: string;
+  session_id: string;
+  conversation_id: string;
+  channel: string;
+  user_id: string;
+  args_hash: string;
+  args_json: string | null;
+  status: ToolAuditRecord["status"];
+  error_message: string | null;
+  result_metadata_json: string | null;
+  started_at: number;
+  finished_at: number | null;
+};
+
 /**
  * 基于 SQLite 的结构化会话存储。
  *
  * Node.js 22.19+ 内置 node:sqlite，因此不需要额外安装原生 npm 依赖。
  * messages 表是唯一可信的数据来源；FTS5 表是由 SQLite 触发器维护的派生索引。
  */
-export class SqliteSessionStore implements SessionStore {
+export class SqliteSessionStore implements SessionStore, ToolAuditStore {
   private readonly database: DatabaseSync;
   private readonly getSessionStatement: StatementSync;
   private readonly insertSessionStatement: StatementSync;
@@ -429,6 +481,8 @@ export class SqliteSessionStore implements SessionStore {
   private readonly deleteMessagesStatement: StatementSync;
   private readonly updateSessionCountStatement: StatementSync;
   private readonly resetSessionStatement: StatementSync;
+  private readonly insertToolCallStatement: StatementSync;
+  private readonly finishToolCallStatement: StatementSync;
 
   constructor(databasePath: string) {
     mkdirSync(dirname(databasePath), { recursive: true });
@@ -558,6 +612,33 @@ export class SqliteSessionStore implements SessionStore {
       SET message_count = 0, updated_at = ?
       WHERE id = ?
     `);
+    this.insertToolCallStatement = this.database.prepare(`
+      INSERT INTO tool_calls (
+        id,
+        request_id,
+        tool_call_id,
+        tool_name,
+        toolset,
+        risk,
+        session_id,
+        conversation_id,
+        channel,
+        user_id,
+        args_hash,
+        args_json,
+        status,
+        started_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'started', ?)
+    `);
+    this.finishToolCallStatement = this.database.prepare(`
+      UPDATE tool_calls
+      SET
+        status = ?,
+        error_message = ?,
+        result_metadata_json = ?,
+        finished_at = ?
+      WHERE id = ? AND status = 'started'
+    `);
   }
 
   async getOrCreate(
@@ -672,6 +753,96 @@ export class SqliteSessionStore implements SessionStore {
         sessionId,
       );
     });
+  }
+
+  async startToolCall(record: ToolAuditStart): Promise<void> {
+    this.withWriteTransaction(() => {
+      const session = this.getSessionStatement.get(record.sessionId);
+      if (!session) throw new Error(`会话 ${record.sessionId} 不存在。`);
+      this.insertToolCallStatement.run(
+        record.auditId,
+        record.requestId,
+        record.toolCallId,
+        record.toolName,
+        record.toolset,
+        record.risk,
+        record.sessionId,
+        record.conversationId,
+        record.channel,
+        record.userId,
+        record.argsHash,
+        record.argsJson,
+        record.startedAt,
+      );
+    });
+  }
+
+  async finishToolCall(
+    auditId: string,
+    update: ToolAuditFinish,
+  ): Promise<void> {
+    const resultMetadataJson = serializeAuditMetadata(update.resultMetadata);
+    this.withWriteTransaction(() => {
+      const result = this.finishToolCallStatement.run(
+        update.status,
+        update.errorMessage ?? null,
+        resultMetadataJson,
+        update.finishedAt,
+        auditId,
+      );
+      if (Number(result.changes) !== 1) {
+        throw new Error(`工具审计记录 ${auditId} 不存在或已经结束。`);
+      }
+    });
+  }
+
+  async listToolCalls(
+    options: ToolAuditListOptions = {},
+  ): Promise<ToolAuditRecord[]> {
+    const where: string[] = [];
+    const parameters: Array<string | number> = [];
+    if (options.sessionId) {
+      where.push("session_id = ?");
+      parameters.push(options.sessionId);
+    }
+    if (options.userId) {
+      where.push("user_id = ?");
+      parameters.push(options.userId);
+    }
+    if (options.toolName) {
+      where.push("tool_name = ?");
+      parameters.push(options.toolName);
+    }
+
+    const limit = normalizeAuditLimit(options.limit);
+    parameters.push(limit);
+    const rows = this.database
+      .prepare(`
+        SELECT
+          id,
+          request_id,
+          tool_call_id,
+          tool_name,
+          toolset,
+          risk,
+          session_id,
+          conversation_id,
+          channel,
+          user_id,
+          args_hash,
+          args_json,
+          status,
+          error_message,
+          result_metadata_json,
+          started_at,
+          finished_at
+        FROM tool_calls
+        ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
+        ORDER BY started_at DESC
+        LIMIT ?
+      `)
+      .all(...parameters) as unknown as ToolCallRow[];
+    return rows.map((row) => this.toToolAuditRecord(row));
   }
 
   async search(
@@ -810,6 +981,29 @@ export class SqliteSessionStore implements SessionStore {
       updatedAt: Number(row.updated_at),
       parentSessionId: row.parent_session_id,
       messageCount: Number(row.message_count),
+    };
+  }
+
+  private toToolAuditRecord(row: ToolCallRow): ToolAuditRecord {
+    return {
+      auditId: row.id,
+      requestId: row.request_id,
+      toolCallId: row.tool_call_id,
+      toolName: row.tool_name,
+      toolset: row.toolset,
+      risk: row.risk,
+      sessionId: row.session_id,
+      conversationId: row.conversation_id,
+      channel: row.channel,
+      userId: row.user_id,
+      argsHash: row.args_hash,
+      argsJson: row.args_json,
+      status: row.status,
+      errorMessage: row.error_message,
+      resultMetadata: parseAuditMetadata(row.result_metadata_json),
+      startedAt: Number(row.started_at),
+      finishedAt:
+        row.finished_at === null ? null : Number(row.finished_at),
     };
   }
 

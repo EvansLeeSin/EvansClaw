@@ -70,8 +70,8 @@ CLI / Telegram / 飞书 / Web / Cron
 |---|---|---|---|---|
 | 1 | SQLite 会话 + 全文搜索 | 当前 SessionStore | 高 | 已完成 |
 | 2 | Context 压缩 | 会话结构化存储、模型调用 | 高 | 已完成基础实现 |
-| 3 | Skills 按需加载 | Prompt 构造、文件读取 | 中 | 待实现 |
-| 4 | Tool Registry | Agent Tool API | 高 | 待实现 |
+| 3 | Skills 按需加载 | Prompt 构造、文件读取 | 中 | 已完成基础实现 |
+| 4 | Tool Registry | Agent Tool API、TypeBox、SessionStore | 高 | 已完成基础实现 |
 | 5 | Tool Policy 和人工确认 | Tool Registry、身份上下文 | 高 | 待实现 |
 | 6 | Channel Gateway | AgentManager、Policy | 高 | 待实现 |
 | 7 | Cron 定时任务 | Gateway、会话/任务存储 | 中 | 待实现 |
@@ -258,25 +258,32 @@ interface SessionStore {
 
 把流程知识、领域知识和使用说明从固定系统提示词中分离出来，只在需要时加载，降低 Token 消耗并提升可维护性。
 
-### 建议目录
+本模块采用 [Agent Skills Specification](https://agentskills.io/specification) 的 `SKILL.md` 基线，并参考 [OpenClaw Skills](https://docs.openclaw.ai/tools/skills) 的元数据索引和渐进式加载行为；没有引入 OpenClaw runtime。
+
+### 已实现目录
 
 ```text
 skills/
-├─ weather/
-│  └─ SKILL.md
-├─ meeting-summary/
-│  └─ SKILL.md
-└─ personal-notes/
+├─ README.md
+└─ <skill-name>/
+   └─ SKILL.md
+
+.agents/skills/
+└─ <skill-name>/
    └─ SKILL.md
 ```
 
-### `SKILL.md` 建议格式
+启动时 `main.ts` 扫描项目 `skills/` 和 `.agents/skills/`，后者优先级更高。Skill 名称必须与父目录一致，并由小写字母、数字和单个连字符组成。
+
+### `SKILL.md` 格式
 
 ```md
 ---
 name: meeting-summary
 description: 整理会议记录并生成行动项
 version: 0.1.0
+metadata:
+  owner: evansclaw
 ---
 
 # 会议纪要整理
@@ -291,98 +298,170 @@ version: 0.1.0
 ...
 ```
 
-### 加载流程
+解析器使用 `yaml` 读取 frontmatter，并校验：
+
+- `name`、`description` 必须存在；
+- `name` 与父目录一致；
+- `description` 不超过 1,024 个字符；
+- 单个 `SKILL.md` 默认不超过 256 KiB；
+- 可选的 `license`、`compatibility`、`allowed-tools`、`version`、`metadata` 和调用控制字段类型正确。
+
+### 实际加载流程
 
 ```text
-用户请求
-  → Skill Registry 根据名称/描述匹配
-  → 只向模型暴露 Skill 元数据
-  → Agent 决定是否加载
-  → 加载完整 SKILL.md
+启动
+  → SkillRegistry 扫描受信任目录
+  → 只索引 name/description 等元数据
+
+每轮请求
+  → 显式 /skill-name 或 $skill-name
+  → 或根据名称/描述进行保守匹配
+  → 当前 system prompt 只加入匹配 Skill 正文
+  → 模型也可以调用只读 load_skill(name)
   → 按 Skill 流程工作
 ```
+
+当前实现位置：
+
+- `src/skills/skill-types.ts`：Skill、来源和诊断类型；
+- `src/skills/skill-parser.ts`：YAML frontmatter 解析和校验；
+- `src/skills/skill-registry.ts`：扫描、优先级、路径安全和 `load_skill`；
+- `src/skills/skill-prompt.ts`：元数据目录、显式引用和保守匹配；
+- `src/chat/chat-service.ts`：Skill 正文只在当前 turn 临时进入 system prompt；
+- `test/skills.test.ts`：格式、覆盖、按需加载、限制和安全行为测试。
 
 ### 关键设计
 
 - 元数据和完整内容分离，采用渐进式披露。
 - Skill 不应默认获得额外权限。
-- Skill 可以声明需要哪些工具，但最终权限由 Tool Policy 决定。
-- 用户 Skill 和系统 Skill 分开存储。
-- 加载外部 Skill 前应考虑 Prompt Injection 和恶意指令。
-- Skill 版本、来源和修改时间应可追踪。
+- `allowed-tools` 目前只作为元数据保留，最终权限由未来 Tool Policy 决定。
+- `load_skill` 只能按名称读取已索引的 `SKILL.md`，不能读取任意路径。
+- 符号链接、目录穿越、超大文件和无效 frontmatter 默认拒绝或跳过。
+- Skill 目录中的脚本和其他资源不会自动执行。
+- Skill 正文视为不可信知识，不能覆盖系统指令或工具权限。
+- Skill 来源、优先级和修改时间可由 Registry 追踪。
 
-### 验收标准
+### 验收结果
 
-- Agent 能发现并按需加载 Skill。
-- 未使用的 Skill 不会全部进入系统 Prompt。
-- Skill 可以独立添加、修改和测试。
-- Skill 无法绕过工具权限和人工确认。
+- [x] Agent 可以通过元数据目录和 `load_skill` 发现并加载 Skill。
+- [x] 显式 `/skill-name`、`$skill-name` 和保守的名称/描述匹配可以激活 Skill。
+- [x] 未使用的 Skill 正文不会全部进入系统 Prompt。
+- [x] Skill 可以独立添加、修改和测试。
+- [x] Skill 不会自动执行脚本或绕过未来的工具权限边界。
+- [x] 无效 Skill 不会阻塞其他有效 Skill 的发现。
+
+### 当前限制
+
+- 当前扫描发生在启动时，没有文件监听和热更新。
+- `references/`、`assets/` 和 `scripts/` 只作为 Skill 目录资源存在，不会自动加载或执行。
+- `load_skill` 已迁移为通用 Tool Registry 中的只读工具；它只能按名称读取已索引 Skill，不会读取任意路径或执行目录资源。
+- 跨重启的人工确认和 Skill 权限控制留待模块五。
 
 ---
 
 ## 7. 模块四：Tool Registry
 
-### 目标
+### 状态：基础实现已完成
 
-建立统一的工具注册、发现、调用和错误处理机制。
+模块四把此前直接挂在 SkillRegistry 上的 `load_skill` 桥接工具迁移到统一的工具边界，并先提供三个无副作用工具。它只负责“工具是什么、如何校验和执行”，不负责决定“当前调用是否有权限”；`allow / deny / ask` 和人工确认留给模块五。
 
-### 建议接口
+### 实际接口
 
 ```ts
-interface ToolDefinition<TInput = unknown> {
+interface ToolDefinition<TParameters extends TSchema = TSchema> {
   name: string;
+  label: string;
   description: string;
-  inputSchema: JsonSchema;
+  parameters: TParameters;
   toolset: string;
   risk: "read" | "write" | "external" | "destructive";
-  execute(input: TInput, context: ToolContext): Promise<ToolResult>;
+  source: "builtin" | "plugin" | "mcp" | "skill";
+  executionMode?: "sequential" | "parallel";
+  timeoutMs?: number;
+  execute(
+    args: Static<TParameters>,
+    context: ToolInvocationContext,
+    onUpdate?: (update: unknown) => void,
+  ): Promise<AgentToolResult<unknown>>;
 }
 
-interface ToolContext {
-  userId?: string;
+interface ToolContextBase {
+  requestId?: string;
+  sessionId: string;
   conversationId: string;
-  signal: AbortSignal;
-  requestId: string;
-  askForApproval(reason: string): Promise<boolean>;
+  channel: string;
+  userId: string;
 }
 ```
 
-### Registry 职责
+对应实现位于：
 
-- 注册工具
-- 按工具组启用/禁用工具
-- 收集 JSON Schema
-- 根据模型的 tool call 找到实现
-- 校验参数
-- 设置超时和取消
-- 统一包装错误
-- 记录工具调用审计
+- `src/tools/tool-types.ts`：工具风险、来源、执行上下文和选择条件；
+- `src/tools/tool-registry.ts`：注册、重名校验、工具组筛选、Pi `AgentTool` 适配、参数校验、超时、取消、结果截断和错误包装；
+- `src/tools/tool-audit.ts`：工具参数稳定序列化、SHA-256 指纹和内存/SQLite 审计接口；
+- `src/tools/builtin-tools.ts`：`search_session` 和 `current_time`；
+- `src/skills/skill-tool.ts`：通过 Registry 注册的只读 `load_skill`；
+- `src/agent/create-agent.ts`：默认以 `sequential` 模式创建 Agent；
+- `src/main.ts`：创建 Registry、注册内置工具并将选定工具传给 Agent。
 
-### 建议工具组
-
-```text
-core      时间、计算等无副作用工具
-search    Web、历史会话搜索
-files     文件读取和编辑
-calendar  日历读取和修改
-tasks     任务读取和创建
-messaging 发消息
-system    命令执行
-```
-
-初期只开放：
+### 当前注册工具
 
 ```text
-core + 只读 search
+skills  / load_skill       按名称读取已索引的 SKILL.md
+search  / search_session   在当前 user/session 范围内搜索历史消息
+core    / current_time     返回当前时间和可选 IANA 时区结果
 ```
 
-### 验收标准
+所有初始工具都是 `read` 风险等级。`search_session` 强制使用 Tool Context 中的 `sessionId` 和 `userId`，模型参数不能扩大搜索范围；`load_skill` 不能读取任意文件、符号链接或 Skill 目录中的脚本。
 
-- 工具可以独立注册和测试。
-- Agent 只能看到已启用工具的 Schema。
-- 非法参数不会进入工具实现。
-- 工具超时和异常不会让主进程崩溃。
-- 每次工具调用都有 request、user、conversation 和结果记录。
+### 执行流程
+
+```text
+AgentTool.execute
+  → Registry 查找已注册定义
+  → TypeBox/Pi 参数校验和必要的 JSON 类型转换
+  → 创建调用级 AbortController
+  → 应用父级取消和超时
+  → 写入 started 审计
+  → 执行工具实现
+  → 截断过大的最终文本结果
+  → 写入 succeeded / failed 审计
+  → 返回结果或抛出可由 Pi 转换为 toolResult 的错误
+```
+
+Registry 在 Pi 之上再次校验参数，以保证直接调用包装后的 `AgentTool` 时也不会把非法参数传入工具实现。参数校验遵循 Pi 的 `validateToolArguments`，因此合法的 JSON 类型转换仍保留；策略层不会在本模块内偷偷介入。
+
+### 工具调用审计
+
+schema migration v3 新增 `tool_calls` 表，保存：
+
+```text
+id, request_id, tool_call_id, tool_name, toolset, risk,
+session_id, conversation_id, channel, user_id,
+args_hash, args_json, status, error_message,
+result_metadata_json, started_at, finished_at
+```
+
+参数使用稳定 JSON 序列化并计算 SHA-256；完整工具结果默认不落库，只保存受限的结果元数据。`InMemoryToolAuditStore` 供单元测试使用，`SqliteSessionStore` 提供生产持久化实现。工具审计与会话写入共用 SQLite 的事务、锁重试和 WAL 边界。
+
+### 当前取舍和限制
+
+- Registry 直接适配 Pi `AgentTool`，不重新实现 Agent Loop。
+- Agent 全局工具执行默认是 `sequential`；定义仍可表达 `parallel`，但在只读并行策略明确前不开放副作用工具。
+- 当前没有 MCP、远程插件发现、文件/Shell/消息等副作用工具。
+- 当前没有 `allow / deny / ask` 策略，也没有人工确认；`risk` 只是审计和未来 Policy 的输入。
+- 工具调用超时、取消或异常会结束本次调用并留下失败审计，不会让主进程崩溃。
+- 工具输出有大小上限，避免一次调用直接膨胀上下文。
+
+### 验收结果
+
+- [x] 工具可以独立注册、注销、筛选和测试。
+- [x] Agent 只接收 Registry 选出的工具 Schema。
+- [x] 非法参数不会进入工具实现。
+- [x] 工具超时、取消和异常不会让主进程崩溃。
+- [x] 每次开始并完成的调用都有 request、user、conversation 和结果状态审计。
+- [x] `load_skill` 已从模块三的临时桥接实现迁移到 Registry。
+- [x] `npm run typecheck` 通过，`npm test` 通过（38 个测试）。
 
 ---
 

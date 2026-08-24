@@ -12,6 +12,10 @@ import {
   restoreContextMessages,
 } from "./context/context-manager.js";
 import { SqliteSessionStore } from "./session/session-store.js";
+import { SkillPromptBuilder } from "./skills/skill-prompt.js";
+import { SkillRegistry } from "./skills/skill-registry.js";
+import { createBuiltinTools } from "./tools/builtin-tools.js";
+import { ToolRegistry } from "./tools/tool-registry.js";
 
 const sessionId = "personal";
 const projectRoot = resolve(import.meta.dirname, "..");
@@ -22,6 +26,24 @@ async function main(): Promise<void> {
 
   const sessionStore = new SqliteSessionStore(databasePath);
   try {
+    const skillRegistry = new SkillRegistry([
+      {
+        path: resolve(projectRoot, "skills"),
+        source: "project",
+        priority: 10,
+      },
+      {
+        path: resolve(projectRoot, ".agents", "skills"),
+        source: "project-agent",
+        priority: 20,
+      },
+    ]);
+    await skillRegistry.refresh();
+    const skillPromptBuilder = new SkillPromptBuilder(
+      config.systemPrompt,
+      skillRegistry,
+    );
+
     // 保留现有的 personal 会话 ID 以兼容 CLI，同时写入明确的频道/用户元数据，
     // 为未来支持多个聊天频道做好准备。
     const session = await sessionStore.getOrCreate(sessionId, {
@@ -30,11 +52,23 @@ async function main(): Promise<void> {
       userId: "local",
       model: config.model,
     });
+    const toolRegistry = new ToolRegistry({ auditStore: sessionStore });
+    toolRegistry.registerMany(createBuiltinTools(skillRegistry, sessionStore));
     const persistedContext = await sessionStore.loadContext(session.id);
-    const agent = createAgent(restoreContextMessages(persistedContext));
+    const agent = createAgent(restoreContextMessages(persistedContext), {
+      systemPrompt: skillPromptBuilder.buildCatalogPrompt(),
+      tools: toolRegistry.createAgentTools({
+        sessionId: session.id,
+        conversationId: session.conversationId,
+        channel: session.channel,
+        userId: session.userId,
+      }),
+      toolExecution: "sequential",
+    });
     const chat = new ChatService(agent, sessionStore, session.id, {
       contextManager: new ContextManager(createContextSummarizer()),
       initialCompaction: persistedContext.compaction,
+      skillPromptBuilder,
     });
     const readline = createInterface({ input, output });
 
