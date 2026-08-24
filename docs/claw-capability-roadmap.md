@@ -538,6 +538,32 @@ npm run web
 
 默认监听 `127.0.0.1:8787`，可通过 `EVANSCLAW_WEB_HOST`、`EVANSCLAW_WEB_PORT`、`EVANSCLAW_WEB_CORS_ORIGIN` 和 `EVANSCLAW_WEB_SESSION_ID` 配置。当前 Gateway 没有认证，只适合本机或受信任的开发环境；它只暴露一个配置好的 Web 会话，不支持多用户、多会话动态创建和外部平台适配。
 
+### 当前状态：Web 前端（web/）已完成基础聊天界面
+
+技术选型：Vite + React 19 + TypeScript + Tailwind CSS v4 + shadcn/ui（Base UI 版聊天组件：`MessageScroller`/`Message`/`Bubble`/`Marker`），Markdown 渲染用 react-markdown + rehype-highlight。
+
+- `web/src/lib/api.ts`：Gateway 客户端（REST + 手动解析 POST SSE 流，复刻 `delta`/`done`/`error` 事件）；
+- `web/src/lib/types.ts`：与后端 `AgentMessage` JSON 对齐的只读渲染类型；
+- `web/src/components/chat/`：聊天主界面与消息渲染——
+  - user 消息：右对齐气泡；
+  - assistant 消息：thinking 折叠块、Markdown 正文、工具调用卡片（按 `toolCallId` 把 `toolResult` 合并进对应 `toolCall` 展示）；
+  - 流式回复：发送时乐观插入用户消息，SSE 增量渲染，`done` 后重新拉取全量消息以对齐 SQLite 事实；
+  - 会话重置（两段式确认）、连接错误横幅与重试；
+- `web/vite.config.ts`：开发期 `/api` 代理到 `127.0.0.1:8787`，无需 CORS；
+- `web/mock/gateway.mjs`：无需 DeepSeek API Key 的 mock Gateway（覆盖全部渲染分支的预置历史 + SSE 流式回复）；
+- `web/mock/smoke.mjs`：puppeteer-core 驱动本机 Edge 的无头冒烟测试。
+
+开发与验证：
+
+```bash
+npm run web          # 启动真实 Gateway（需 DEEPSEEK_API_KEY）
+npm run dev:ui       # 启动前端开发服务器（localhost:5173，代理 /api）
+# 或免 Key 联调：
+cd web && npm run mock    # 终端 1：mock Gateway（127.0.0.1:8787）
+npm run dev               # 终端 2：前端开发服务器
+npm run smoke             # 终端 3：无头浏览器冒烟测试
+```
+
 ### 目标
 
 把 CLI、Telegram、飞书和其他消息平台统一接入同一个 Agent 核心。

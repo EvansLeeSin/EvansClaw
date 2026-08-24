@@ -93,6 +93,17 @@ POST /api/sessions/:id/messages   # {"text":"..."}，SSE 流式响应
 POST /api/sessions/:id/reset
 ```
 
+### Web 前端
+
+`web/` 目录是一个 Vite + React + TypeScript + shadcn/ui 的聊天前端（详见 `docs/claw-capability-roadmap.md` 模块六）：
+
+```bash
+npm run web        # 终端 1：启动 Gateway（需 DEEPSEEK_API_KEY）
+npm run dev:ui     # 终端 2：启动前端开发服务器 http://localhost:5173
+```
+
+无 API Key 时可用 mock Gateway 联调：`cd web && npm run mock`，并用 `npm run smoke` 跑无头浏览器冒烟测试。
+
 默认 Web 会话为 `web:local:personal`，与 CLI 的 `personal` 会话分开。可通过 `EVANSCLAW_WEB_HOST`、`EVANSCLAW_WEB_PORT`、`EVANSCLAW_WEB_CORS_ORIGIN` 和 `EVANSCLAW_WEB_SESSION_ID` 配置。Gateway 默认只监听本机且没有认证，不应直接暴露到公网。
 
 ## Skills

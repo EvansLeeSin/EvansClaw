@@ -1,0 +1,93 @@
+/**
+ * 无头浏览器冒烟测试：用本机 Edge/Chrome 渲染前端页面，
+ * 验证「加载会话 → 渲染历史消息 → 发送 → SSE 流式输出 → 重同步」全链路。
+ *
+ * 前置条件：mock gateway（或真实 gateway）已在 127.0.0.1:8787 运行，
+ * vite dev server 已在 5173 运行。
+ *
+ *   node web/mock/smoke.mjs
+ */
+
+import puppeteer from "puppeteer-core";
+import { existsSync } from "node:fs";
+
+const BROWSER_CANDIDATES = [
+  "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe",
+  "C:/Program Files/Microsoft/Edge/Application/msedge.exe",
+  "C:/Program Files/Google/Chrome/Application/chrome.exe",
+];
+
+const browserPath = BROWSER_CANDIDATES.find(existsSync);
+if (!browserPath) {
+  console.error("未找到 Edge/Chrome，无法运行冒烟测试。");
+  process.exit(1);
+}
+
+const browser = await puppeteer.launch({
+  executablePath: browserPath,
+  headless: true,
+  args: ["--disable-gpu", "--no-first-run"],
+});
+
+try {
+  const page = await browser.newPage();
+  await page.setViewport({ width: 1280, height: 900 });
+  const errors = [];
+  page.on("pageerror", (error) => errors.push(`pageerror: ${error.message}`));
+  page.on("console", (message) => {
+    if (message.type() === "error") errors.push(`console: ${message.text()}`);
+  });
+
+  await page.goto("http://localhost:5173", { waitUntil: "networkidle0" });
+
+  // 1) 历史消息渲染：mock 会话标题 + 工具卡片 + thinking 块
+  const headerText = await page.$eval("header h1", (el) => el.textContent);
+  const bodyText = await page.evaluate(() => document.body.innerText);
+  const checks = [
+    ["会话标题", headerText.includes("Mock 会话")],
+    ["thinking 折叠块", bodyText.includes("思考过程")],
+    ["工具调用卡片", bodyText.includes("current_time")],
+    ["markdown 代码块", bodyText.includes("CREATE TABLE")],
+    ["markdown 标题", bodyText.includes("SQLite 简介")],
+  ];
+
+  // 2) 发送消息 → SSE 流式输出 → 完成后重同步
+  // 先展开工具调用卡片，验证参数与结果都在（折叠时 innerText 不含隐藏内容）。
+  await page.click("details.group\\/tool summary");
+  const expandedText = await page.evaluate(() => document.body.innerText);
+  checks.push(["工具调用参数", expandedText.includes("current_time")]);
+  checks.push(["工具执行结果", expandedText.includes("Asia/Shanghai")]);
+
+  await page.type("textarea", "你好，来一段流式回复");
+  await page.click('button[aria-label="发送"]');
+  await page.waitForFunction(
+    () => document.body.innerText.includes("流式回复"),
+    { timeout: 15000 },
+  );
+  // done 之后前端会重新拉取全量消息，工具卡片数量应保持稳定
+  await page.waitForFunction(
+    () => document.body.innerText.includes("回复完毕"),
+    { timeout: 15000 },
+  );
+  await new Promise((resolve) => setTimeout(resolve, 1500));
+  const afterText = await page.evaluate(() => document.body.innerText);
+  checks.push(["用户消息上屏", afterText.includes("你好，来一段流式回复")]);
+  checks.push(["流式回复渲染", afterText.includes("这是 mock 网关的流式回复")]);
+
+  let failed = 0;
+  for (const [name, passed] of checks) {
+    console.log(`${passed ? "✓" : "✗"} ${name}`);
+    if (!passed) failed++;
+  }
+  if (errors.length) {
+    console.log("\n浏览器错误：");
+    for (const error of errors) console.log(`  ${error}`);
+    failed++;
+  }
+
+  await page.screenshot({ path: "mock/smoke.png", fullPage: false });
+  console.log(`\n截图：web/mock/smoke.png`);
+  process.exitCode = failed ? 1 : 0;
+} finally {
+  await browser.close();
+}

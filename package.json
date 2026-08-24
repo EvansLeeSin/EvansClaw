@@ -9,6 +9,8 @@
     "start": "node --import tsx src/main.ts",
     "dev:web": "tsx src/web-main.ts",
     "web": "node --import tsx src/web-main.ts",
+    "dev:ui": "npm --prefix web run dev",
+    "build:ui": "npm --prefix web run build",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test"
   },
