@@ -20,8 +20,9 @@
 - 支持按 `channel`、`userId`、`conversationId` 和 `sessionId` 隔离搜索
 - 使用 migration 表、事务、WAL 和 SQLite 写锁重试
 - 数据库固定保存于项目根目录：`data/evansclaw.sqlite`
-- 当前无外部工具、无消息平台、无定时任务
-- 当前 CLI 使用单一会话 ID：`personal`
+- 当前没有 Telegram、飞书等外部消息平台和定时任务；已增加仅监听本机的轻量 Web Gateway
+- Web Gateway 提供单一 Web 会话、HTTP JSON API 和 POST + SSE 流式回复
+- CLI 使用会话 ID `personal`，Web 默认使用 `web:local:personal`，避免两个进程共享同一个 Agent 内存状态
 
 模块一“SQLite 会话 + 全文搜索”已完成基础实现和测试。当前还没有 CLI `/search` 命令，搜索能力通过 `SessionStore.search()` API 提供。
 
@@ -73,7 +74,7 @@ CLI / Telegram / 飞书 / Web / Cron
 | 3 | Skills 按需加载 | Prompt 构造、文件读取 | 中 | 已完成基础实现 |
 | 4 | Tool Registry | Agent Tool API、TypeBox、SessionStore | 高 | 已完成基础实现 |
 | 5 | Tool Policy 和人工确认 | Tool Registry、身份上下文 | 高 | 待实现 |
-| 6 | Channel Gateway | AgentManager、Policy | 高 | 待实现 |
+| 6 | Channel Gateway | AgentManager、Policy | 高 | Web 基础 Gateway 已完成，外部渠道待实现 |
 | 7 | Cron 定时任务 | Gateway、会话/任务存储 | 中 | 待实现 |
 | 8 | 长期记忆和用户画像 | SQLite、检索、Policy | 中 | 待实现 |
 
@@ -514,6 +515,28 @@ result_metadata_json, started_at, finished_at
 ---
 
 ## 9. 模块六：Channel Gateway
+
+### 当前状态：轻量 Web Gateway 已完成，完整 Channel Gateway 待实现
+
+当前已新增：
+
+- `src/gateway/web-gateway.ts`：Node.js 内置 `node:http` 实现的本地 HTTP Gateway；
+- `src/web-main.ts`：独立 Web Gateway 启动入口；
+- `src/app/chat-runtime.ts`：CLI 与 Web 共用的 Agent/Skill/Tool/Session 组装边界；
+- `GET /api/health`；
+- `GET /api/sessions`；
+- `GET /api/sessions/:id/messages`；
+- `POST /api/sessions/:id/messages`：JSON 请求，SSE 流式返回 `delta`、`done` 或 `error` 事件；
+- `POST /api/sessions/:id/reset`；
+- CORS、请求体大小限制、输入校验和同一会话串行队列。
+
+默认启动：
+
+```bash
+npm run web
+```
+
+默认监听 `127.0.0.1:8787`，可通过 `EVANSCLAW_WEB_HOST`、`EVANSCLAW_WEB_PORT`、`EVANSCLAW_WEB_CORS_ORIGIN` 和 `EVANSCLAW_WEB_SESSION_ID` 配置。当前 Gateway 没有认证，只适合本机或受信任的开发环境；它只暴露一个配置好的 Web 会话，不支持多用户、多会话动态创建和外部平台适配。
 
 ### 目标
 

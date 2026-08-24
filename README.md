@@ -21,6 +21,7 @@
 - Tool Registry：工具注册、筛选、TypeBox 参数校验、超时和取消
 - 只读 `load_skill`、`search_session`、`current_time` 工具（不会执行 Skill 目录中的脚本）
 - SQLite `tool_calls` 工具调用审计
+- 轻量本地 Web Gateway（HTTP JSON API + SSE 流式回复）
 - 可扩展的 `ChatService` 业务边界
 
 DeepSeek 请求地址：
@@ -73,6 +74,26 @@ export EVANSCLAW_MODEL="deepseek-v4-pro"
 - `/help`：显示帮助
 - `/reset`：清空当前会话
 - `/exit`：退出
+
+## Web Gateway
+
+启动本地 Web Gateway：
+
+```bash
+npm run web
+```
+
+默认监听 `http://127.0.0.1:8787`，前端可使用以下接口：
+
+```text
+GET  /api/health
+GET  /api/sessions
+GET  /api/sessions/:id/messages
+POST /api/sessions/:id/messages   # {"text":"..."}，SSE 流式响应
+POST /api/sessions/:id/reset
+```
+
+默认 Web 会话为 `web:local:personal`，与 CLI 的 `personal` 会话分开。可通过 `EVANSCLAW_WEB_HOST`、`EVANSCLAW_WEB_PORT`、`EVANSCLAW_WEB_CORS_ORIGIN` 和 `EVANSCLAW_WEB_SESSION_ID` 配置。Gateway 默认只监听本机且没有认证，不应直接暴露到公网。
 
 ## Skills
 

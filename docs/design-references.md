@@ -77,7 +77,7 @@ CLI / 外部渠道 / Cron
 4. 用户身份、渠道来源和会话标识在进入 Agent 前确定。
 5. 工具权限由策略层决定，不能由模型通过自然语言自行获得。
 
-当前 EvansClaw 只实现了 CLI 和 `ChatService` / `SessionStore` 边界；Channel Gateway、AgentManager 和 Policy Engine 仍属于后续模块。
+当前 EvansClaw 已实现 CLI、`ChatService` / `SessionStore` 边界和一个仅供本地前端使用的轻量 Web Gateway；多用户身份、AgentManager、外部平台 Adapter 和 Policy Engine 仍属于后续模块。
 
 ### 2.3 Skills 使用渐进式披露
 
@@ -225,6 +225,31 @@ User Profile
 
 参考：[Hermes Memory Features](https://hermes-agent.nousresearch.com/docs/user-guide/features/memory)。
 
+### 2.7 轻量 Web Gateway 作为前端接入层
+
+当前 EvansClaw 先实现一个本地 Web Gateway，而不是直接引入 OpenClaw 等完整 Web Runtime。它只负责 HTTP 路由、请求校验、流式响应和会话串行化，Agent 组装仍由共享的 `ChatRuntime` 完成：
+
+```text
+Web Frontend
+  → node:http Web Gateway
+  → ChatRuntime / ChatService
+  → pi-agent-core Agent
+  → Tool Registry / SessionStore
+```
+
+实际实现采用 Node.js 内置 `node:http`，不增加 Web 框架依赖；聊天请求使用 `POST` 搭配 Server-Sent Events 返回 `delta`、`done` 和 `error` 事件。这样既能被 React/Vue 前端消费，也保留了后续替换为更完整 Channel Adapter 的空间。
+
+当前的安全和范围取舍：
+
+- 默认监听 `127.0.0.1`，不提供认证，不应直接暴露公网；
+- 只暴露一个预先配置的 Web 会话，不允许客户端任意创建或访问会话；
+- 同一 Gateway 会话使用串行队列，避免多个请求交错修改同一个 Agent；
+- CLI 和 Web 通过 `src/app/chat-runtime.ts` 共享 Skill、Tool、Context 和 Session 组装逻辑；
+- CORS、请求体大小、文本长度和路径范围均有限制；
+- Web Gateway 不承担多用户身份、外部平台重连、权限策略和人工确认，这些仍属于模块五和完整模块六。
+
+这是对 Hermes/OpenClaw“渠道通过 Gateway 进入 Agent”边界思想的最小化实现，不是复制它们的前端或运行时。当前 Gateway 的目的只是让前端可以安全地接入 EvansClaw，后续再逐步增加身份、AgentManager 和真实 Channel Adapter。
+
 ## 3. Pi 参考的 TypeScript 实现方式
 
 EvansClaw 直接依赖：
@@ -350,12 +375,13 @@ EvansClaw
 - 压缩摘要持久化和重启恢复；
 - Agent Skills `SKILL.md` 解析、索引和按需加载；
 - 当前 turn 的 Skill Prompt 注入；
-- 通用 Tool Registry、三个只读内置工具和 `tool_calls` 审计。
+- 通用 Tool Registry、三个只读内置工具和 `tool_calls` 审计；
+- 轻量本地 Web Gateway、HTTP JSON API 和 SSE 流式聊天接口。
 
 尚未落地：
 
 - Tool Policy 和人工确认；
-- Channel Gateway；
+- 完整 Channel Gateway、多用户身份和 Telegram/飞书等外部 Adapter；
 - Cron；
 - 长期记忆和用户画像。
 

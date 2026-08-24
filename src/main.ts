@@ -1,75 +1,21 @@
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
-import { resolve } from "node:path";
-import {
-  createAgent,
-  createContextSummarizer,
-} from "./agent/create-agent.js";
-import { ChatService } from "./chat/chat-service.js";
-import { assertConfig, config } from "./config.js";
-import {
-  ContextManager,
-  restoreContextMessages,
-} from "./context/context-manager.js";
-import { SqliteSessionStore } from "./session/session-store.js";
-import { SkillPromptBuilder } from "./skills/skill-prompt.js";
-import { SkillRegistry } from "./skills/skill-registry.js";
-import { createBuiltinTools } from "./tools/builtin-tools.js";
-import { ToolRegistry } from "./tools/tool-registry.js";
+import { assertConfig } from "./config.js";
+import { createChatRuntime } from "./app/chat-runtime.js";
 
 const sessionId = "personal";
-const projectRoot = resolve(import.meta.dirname, "..");
-const databasePath = resolve(projectRoot, "data", "evansclaw.sqlite");
 
 async function main(): Promise<void> {
   assertConfig();
 
-  const sessionStore = new SqliteSessionStore(databasePath);
-  try {
-    const skillRegistry = new SkillRegistry([
-      {
-        path: resolve(projectRoot, "skills"),
-        source: "project",
-        priority: 10,
-      },
-      {
-        path: resolve(projectRoot, ".agents", "skills"),
-        source: "project-agent",
-        priority: 20,
-      },
-    ]);
-    await skillRegistry.refresh();
-    const skillPromptBuilder = new SkillPromptBuilder(
-      config.systemPrompt,
-      skillRegistry,
-    );
+  const runtime = await createChatRuntime({
+    sessionId,
+    conversationId: "personal",
+    channel: "cli",
+    userId: "local",
+  });
 
-    // 保留现有的 personal 会话 ID 以兼容 CLI，同时写入明确的频道/用户元数据，
-    // 为未来支持多个聊天频道做好准备。
-    const session = await sessionStore.getOrCreate(sessionId, {
-      conversationId: "personal",
-      channel: "cli",
-      userId: "local",
-      model: config.model,
-    });
-    const toolRegistry = new ToolRegistry({ auditStore: sessionStore });
-    toolRegistry.registerMany(createBuiltinTools(skillRegistry, sessionStore));
-    const persistedContext = await sessionStore.loadContext(session.id);
-    const agent = createAgent(restoreContextMessages(persistedContext), {
-      systemPrompt: skillPromptBuilder.buildCatalogPrompt(),
-      tools: toolRegistry.createAgentTools({
-        sessionId: session.id,
-        conversationId: session.conversationId,
-        channel: session.channel,
-        userId: session.userId,
-      }),
-      toolExecution: "sequential",
-    });
-    const chat = new ChatService(agent, sessionStore, session.id, {
-      contextManager: new ContextManager(createContextSummarizer()),
-      initialCompaction: persistedContext.compaction,
-      skillPromptBuilder,
-    });
+  try {
     const readline = createInterface({ input, output });
 
     console.log("EvansClaw 最小聊天 Agent");
@@ -90,14 +36,14 @@ async function main(): Promise<void> {
         }
 
         if (line === "/reset") {
-          await chat.reset();
+          await runtime.chat.reset();
           console.log("当前对话已清空。\n");
           continue;
         }
 
         process.stdout.write("EvansClaw > ");
         try {
-          await chat.send(line, (delta) => process.stdout.write(delta));
+          await runtime.chat.send(line, (delta) => process.stdout.write(delta));
           process.stdout.write("\n\n");
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
@@ -108,7 +54,7 @@ async function main(): Promise<void> {
       readline.close();
     }
   } finally {
-    sessionStore.close();
+    runtime.close();
   }
 }
 
