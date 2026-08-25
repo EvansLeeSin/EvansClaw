@@ -22,6 +22,7 @@
 - 只读 `load_skill`、`search_session`、`current_time` 工具（不会执行 Skill 目录中的脚本）
 - SQLite `tool_calls` 工具调用审计
 - 轻量本地 Web Gateway（HTTP JSON API + SSE 流式回复）
+- Vite + React + shadcn/ui Web 聊天界面（Gateway 同源静态托管）
 - 可扩展的 `ChatService` 业务边界
 
 DeepSeek 请求地址：
@@ -39,7 +40,10 @@ https://api.deepseek.com/anthropic
 
 ```bash
 npm install
+npm --prefix web install
 ```
+
+第二条安装独立 `web/` 前端子项目的依赖。
 
 ## 配置并运行
 
@@ -75,15 +79,17 @@ export EVANSCLAW_MODEL="deepseek-v4-pro"
 - `/reset`：清空当前会话
 - `/exit`：退出
 
-## Web Gateway
+## Web 应用与 Gateway
 
-启动本地 Web Gateway：
+启动完整 Web 应用：
 
 ```bash
 npm run web
 ```
 
-默认监听 `http://127.0.0.1:8787`，前端可使用以下接口：
+`preweb` 会先自动构建 `web/`，随后由同一个 Gateway 进程托管前端静态文件和 API。浏览器直接访问 `http://127.0.0.1:8787`，不需要另外启动 Vite 或配置跨域。
+
+Gateway 提供以下接口：
 
 ```text
 GET  /api/health
@@ -93,18 +99,18 @@ POST /api/sessions/:id/messages   # {"text":"..."}，SSE 流式响应
 POST /api/sessions/:id/reset
 ```
 
-### Web 前端
+### 前端开发模式
 
-`web/` 目录是一个 Vite + React + TypeScript + shadcn/ui 的聊天前端（详见 `docs/claw-capability-roadmap.md` 模块六）：
+`web/` 是独立的 Vite + React + TypeScript + shadcn/ui 子项目。需要热更新时运行两个进程：
 
 ```bash
-npm run web        # 终端 1：启动 Gateway（需 DEEPSEEK_API_KEY）
-npm run dev:ui     # 终端 2：启动前端开发服务器 http://localhost:5173
+npm run dev:web     # 终端 1：Gateway（需 DEEPSEEK_API_KEY）
+npm run dev:ui      # 终端 2：Vite http://localhost:5173，/api 代理到 8787
 ```
 
 无 API Key 时可用 mock Gateway 联调：`cd web && npm run mock`，并用 `npm run smoke` 跑无头浏览器冒烟测试。
 
-默认 Web 会话为 `web:local:personal`，与 CLI 的 `personal` 会话分开。可通过 `EVANSCLAW_WEB_HOST`、`EVANSCLAW_WEB_PORT`、`EVANSCLAW_WEB_CORS_ORIGIN` 和 `EVANSCLAW_WEB_SESSION_ID` 配置。Gateway 默认只监听本机且没有认证，不应直接暴露到公网。
+默认 Web 会话为 `web:local:personal`，与 CLI 的 `personal` 会话分开。可通过 `EVANSCLAW_WEB_HOST`、`EVANSCLAW_WEB_PORT`、`EVANSCLAW_WEB_CORS_ORIGIN` 和 `EVANSCLAW_WEB_SESSION_ID` 配置。`EVANSCLAW_WEB_STATIC_DIR` 可覆盖默认的 `web/dist` 静态目录；显式目录无效时启动会失败并给出错误。Gateway 默认只监听本机且没有认证，不应直接暴露到公网。
 
 ## Skills
 

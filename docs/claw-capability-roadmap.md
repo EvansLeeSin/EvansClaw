@@ -528,13 +528,16 @@ result_metadata_json, started_at, finished_at
 - `GET /api/sessions/:id/messages`；
 - `POST /api/sessions/:id/messages`：JSON 请求，SSE 流式返回 `delta`、`done` 或 `error` 事件；
 - `POST /api/sessions/:id/reset`；
-- CORS、请求体大小限制、输入校验和同一会话串行队列。
+- CORS、请求体大小限制、输入校验和同一会话串行队列；
+- 同源静态托管：非 `/api` 的 GET/HEAD 请求从 `web/dist` 返回，支持 MIME、Vite `assets/` 长缓存、SPA `index.html` 回退和路径穿越防护。
 
 默认启动：
 
 ```bash
 npm run web
 ```
+
+`npm run web` 的 `preweb` 生命周期会先执行 `build:ui`，因此一个命令即可构建前端并启动完整应用；浏览器直接访问 `http://127.0.0.1:8787`。缺少 `web/dist` 时 `dev:web` 仍可退化为纯 API 模式。默认静态目录可用 `EVANSCLAW_WEB_STATIC_DIR` 覆盖，显式目录无效时启动失败。
 
 默认监听 `127.0.0.1:8787`，可通过 `EVANSCLAW_WEB_HOST`、`EVANSCLAW_WEB_PORT`、`EVANSCLAW_WEB_CORS_ORIGIN` 和 `EVANSCLAW_WEB_SESSION_ID` 配置。当前 Gateway 没有认证，只适合本机或受信任的开发环境；它只暴露一个配置好的 Web 会话，不支持多用户、多会话动态创建和外部平台适配。
 
@@ -548,20 +551,22 @@ npm run web
   - user 消息：右对齐气泡；
   - assistant 消息：thinking 折叠块、Markdown 正文、工具调用卡片（按 `toolCallId` 把 `toolResult` 合并进对应 `toolCall` 展示）；
   - 流式回复：发送时乐观插入用户消息，SSE 增量渲染，`done` 后重新拉取全量消息以对齐 SQLite 事实；
-  - 会话重置（两段式确认）、连接错误横幅与重试；
+  - 会话重置（两段式确认）、连接/对话错误横幅与重试；失败轮次 refetch 时保留错误提示；
 - `web/vite.config.ts`：开发期 `/api` 代理到 `127.0.0.1:8787`，无需 CORS；
 - `web/mock/gateway.mjs`：无需 DeepSeek API Key 的 mock Gateway（覆盖全部渲染分支的预置历史 + SSE 流式回复）；
 - `web/mock/smoke.mjs`：puppeteer-core 驱动本机 Edge 的无头冒烟测试。
 
-开发与验证：
+运行、开发与验证：
 
 ```bash
-npm run web          # 启动真实 Gateway（需 DEEPSEEK_API_KEY）
-npm run dev:ui       # 启动前端开发服务器（localhost:5173，代理 /api）
-# 或免 Key 联调：
-cd web && npm run mock    # 终端 1：mock Gateway（127.0.0.1:8787）
-npm run dev               # 终端 2：前端开发服务器
-npm run smoke             # 终端 3：无头浏览器冒烟测试
+npm run web              # 单进程：自动 build:ui，再启动 Gateway + 同源前端（需 Key）
+# 热更新开发：
+npm run dev:web          # 终端 1：Gateway（需 Key）
+npm run dev:ui           # 终端 2：Vite 5173，代理 /api
+# 免 Key 联调：
+cd web && npm run mock   # 终端 1：mock Gateway（127.0.0.1:8787）
+npm run dev              # 终端 2：前端开发服务器
+npm run smoke            # 终端 3：无头浏览器冒烟测试
 ```
 
 ### 目标

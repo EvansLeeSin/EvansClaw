@@ -1,6 +1,6 @@
 /**
  * 无头浏览器冒烟测试：用本机 Edge/Chrome 渲染前端页面，
- * 验证「加载会话 → 渲染历史消息 → 发送 → SSE 流式输出 → 重同步」全链路。
+ * 验证「加载会话 → 渲染历史消息 → SSE 流式输出/错误 → 重同步」全链路。
  *
  * 前置条件：mock gateway（或真实 gateway）已在 127.0.0.1:8787 运行，
  * vite dev server 已在 5173 运行。
@@ -73,6 +73,31 @@ try {
   const afterText = await page.evaluate(() => document.body.innerText);
   checks.push(["用户消息上屏", afterText.includes("你好，来一段流式回复")]);
   checks.push(["流式回复渲染", afterText.includes("这是 mock 网关的流式回复")]);
+
+  // 3) SSE error → refetch 已部分持久化消息，但错误横幅必须继续保留。
+  await page.type("textarea", "__mock_error__");
+  await page.click('button[aria-label="发送"]');
+  await page.waitForFunction(
+    () =>
+      document
+        .querySelector('[role="alert"]')
+        ?.textContent?.includes("Mock 对话失败") ?? false,
+    { timeout: 15000 },
+  );
+  // 留出 refetch 完成时间：旧实现会在这里把错误状态清空。
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  const errorState = await page.evaluate(() => ({
+    alert: document.querySelector('[role="alert"]')?.textContent ?? "",
+    body: document.body.innerText,
+  }));
+  checks.push([
+    "SSE 错误提示保留",
+    errorState.alert.includes("对话请求失败：Mock 对话失败"),
+  ]);
+  checks.push([
+    "失败轮次同步",
+    errorState.body.includes("__mock_error__") && errorState.alert.includes("重试"),
+  ]);
 
   let failed = 0;
   for (const [name, passed] of checks) {

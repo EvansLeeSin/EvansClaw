@@ -142,10 +142,6 @@ const server = createServer((request, response) => {
     return sendJson(200, { sessions: [sessionRecord()] });
   }
 
-  if (request.method === "GET" && url.pathname === "/api/sessions") {
-    return sendJson(200, { sessions: [sessionRecord()] });
-  }
-
   if (request.method === "GET" && isMessagesRoute) {
     return sendJson(200, { session: sessionRecord(), messages: history });
   }
@@ -160,6 +156,19 @@ const server = createServer((request, response) => {
         "Content-Type": "text/event-stream; charset=utf-8",
         "Cache-Control": "no-cache",
       });
+
+      // 回归夹具：触发 SSE error，验证前端 refetch 后仍保留错误横幅。
+      if (text === "__mock_error__") {
+        response.write(
+          `event: error\ndata: ${JSON.stringify({
+            error: "chat_failed",
+            message: "Mock 对话失败",
+          })}\n\n`,
+        );
+        response.end();
+        return;
+      }
+
       let index = 0;
       const timer = setInterval(() => {
         if (index < replyChunks.length) {

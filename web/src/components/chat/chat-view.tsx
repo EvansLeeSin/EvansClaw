@@ -54,24 +54,31 @@ export function ChatView() {
     undefined,
   );
 
-  /** 拉取会话元数据 + 完整消息列表。 */
-  const reload = useCallback(async (): Promise<void> => {
-    let currentSession: SessionRecord;
-    try {
-      // 会话元数据先落地：即使历史拉取失败，头部也能正确展示并允许重试。
-      currentSession = await fetchSession();
-      setSession(currentSession);
-      const history = await fetchMessages(currentSession.id);
-      setMessages(history);
-      setLoadError(null);
-    } catch (error) {
-      setLoadError(
-        error instanceof GatewayError
-          ? `无法连接 EvansClaw Gateway：${error.message}`
-          : "无法连接 EvansClaw Gateway，请确认 npm run web 已启动。",
-      );
-    }
-  }, []);
+  /**
+   * 拉取会话元数据 + 完整消息列表。
+   * preserveError 用于“本轮发送失败后仍需同步已部分持久化消息”的场景：
+   * 同步成功不能把刚显示的对话错误横幅立即清掉。
+   */
+  const reload = useCallback(
+    async (options?: { preserveError?: boolean }): Promise<void> => {
+      let currentSession: SessionRecord;
+      try {
+        // 会话元数据先落地：即使历史拉取失败，头部也能正确展示并允许重试。
+        currentSession = await fetchSession();
+        setSession(currentSession);
+        const history = await fetchMessages(currentSession.id);
+        setMessages(history);
+        if (!options?.preserveError) setLoadError(null);
+      } catch (error) {
+        setLoadError(
+          error instanceof GatewayError
+            ? `无法连接 EvansClaw Gateway：${error.message}`
+            : "无法连接 EvansClaw Gateway，请确认 npm run web 已启动。",
+        );
+      }
+    },
+    [],
+  );
 
   useEffect(() => {
     void reload();
@@ -104,20 +111,23 @@ export function ChatView() {
     setSending(true);
     setStreamingText("");
     setLoadError(null);
+    let requestFailed = false;
 
     try {
       await sendMessage(session.id, text, {
         onDelta: (delta) => setStreamingText((prev) => (prev ?? "") + delta),
       });
     } catch (error) {
-      setLoadError(
-        error instanceof Error ? error.message : "对话请求失败。",
-      );
+      requestFailed = true;
+      // 发送失败：优先展示网关消息，但包一层上下文避免裸显原始 JSON/堆栈。
+      const detail = error instanceof Error ? error.message : String(error);
+      setLoadError(`对话请求失败：${detail}`);
     } finally {
       setStreamingText(null);
       setSending(false);
-      // 无论成败都以服务端为准重新同步（失败的轮次可能已部分持久化）。
-      await reload();
+      // 无论成败都以服务端为准重新同步（失败的轮次可能已部分持久化）；
+      // 但同步成功不能把刚产生的发送错误立即清掉。
+      await reload({ preserveError: requestFailed });
     }
   }, [input, sending, session, reload]);
 
@@ -182,7 +192,10 @@ export function ChatView() {
       </header>
 
       {loadError && (
-        <div className="flex items-center gap-2 border-b bg-destructive/10 px-4 py-2 text-xs text-destructive">
+        <div
+          role="alert"
+          className="flex items-center gap-2 border-b bg-destructive/10 px-4 py-2 text-xs text-destructive"
+        >
           <CircleAlertIcon className="size-3.5 shrink-0" />
           <span className="min-w-0 flex-1">{loadError}</span>
           <Button variant="ghost" size="sm" onClick={() => void reload()}>

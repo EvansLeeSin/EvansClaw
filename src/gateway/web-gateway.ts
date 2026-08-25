@@ -1,9 +1,11 @@
+import { readFile, stat } from "node:fs/promises";
 import {
   createServer,
   type IncomingMessage,
   type Server,
   type ServerResponse,
 } from "node:http";
+import path from "node:path";
 import type { ChatService } from "../chat/chat-service.js";
 import type {
   SessionRecord,
@@ -25,6 +27,12 @@ export interface WebGatewayOptions {
   corsOrigin?: string;
   maxBodyBytes?: number;
   maxTextChars?: number;
+  /**
+   * 前端静态构建目录（如 web/dist）。设置后，非 /api 的 GET 请求
+   * 会由该目录提供文件，未命中的无扩展名路径回退到 index.html
+   * （SPA 路由）。不设置则维持纯 API 模式。
+   */
+  staticDir?: string;
 }
 
 export interface WebGatewayAddress {
@@ -49,6 +57,8 @@ export class WebGateway {
   private readonly corsOrigin: string;
   private readonly maxBodyBytes: number;
   private readonly maxTextChars: number;
+  /** 前端静态目录（绝对路径）；未配置时 Gateway 只提供 API。 */
+  private readonly staticDir: string | undefined;
   private server: Server | undefined;
   private queueTail: Promise<void> = Promise.resolve();
 
@@ -67,6 +77,9 @@ export class WebGateway {
       options.maxTextChars ?? DEFAULT_MAX_TEXT_CHARS,
       "maxTextChars",
     );
+    this.staticDir = options.staticDir
+      ? path.resolve(options.staticDir)
+      : undefined;
   }
 
   async listen(): Promise<WebGatewayAddress> {
@@ -214,7 +227,60 @@ export class WebGateway {
       return;
     }
 
+    if (
+      (request.method === "GET" || request.method === "HEAD") &&
+      segments[0] !== "api" &&
+      this.staticDir
+    ) {
+      // 非 API 的 GET/HEAD 请求交给前端静态托管（SPA 回退在内部处理）；
+      // HEAD 只返回头部不写正文，方便缓存探测和健康检查工具。
+      await this.handleStatic(url.pathname, response, request.method === "HEAD");
+      return;
+    }
+
     this.sendNotFound(response);
+  }
+
+  /**
+   * 静态文件服务：目录限制在 staticDir 内，路径穿越一律 404；
+   * 命中文件按扩展名返回 MIME，Vite 的 assets/（内容 hash 文件名）
+   * 允许一年不可变缓存，index.html 等入口始终 no-cache。
+   */
+  private async handleStatic(
+    pathname: string,
+    response: ServerResponse,
+    headOnly: boolean,
+  ): Promise<void> {
+    const root = this.staticDir;
+    if (!root) return this.sendNotFound(response);
+
+    const decodedPath = safeDecode(pathname);
+    if (!decodedPath) return this.sendNotFound(response);
+
+    // 解析为绝对路径后做目录限制，防止 ../ 或编码变体逃出 staticDir。
+    const resolved = path.resolve(root, `.${decodedPath}`);
+    if (!isInsideRoot(root, resolved)) {
+      return this.sendNotFound(response);
+    }
+
+    const file = await resolveStaticFile(root, resolved, decodedPath);
+    if (!file) return this.sendNotFound(response);
+
+    const body = await readFile(file);
+    const relative = path.relative(root, file);
+    const cacheControl =
+      relative.split(path.sep)[0] === "assets"
+        ? "public, max-age=31536000, immutable"
+        : "no-cache";
+
+    response.writeHead(200, {
+      "Content-Type": contentTypeFor(file),
+      "Content-Length": body.length,
+      "Cache-Control": cacheControl,
+      "X-Content-Type-Options": "nosniff",
+    });
+    // HEAD 请求只回头部：Content-Length 已声明大小，正文不写。
+    response.end(headOnly ? undefined : body);
   }
 
   private async handleMessage(
@@ -416,4 +482,81 @@ class HttpRequestError extends Error {
     super(message);
     this.name = "HttpRequestError";
   }
+}
+
+/** 静态文件扩展名 → Content-Type 映射，覆盖 Vite 构建产物涉及的类型。 */
+const STATIC_MIME_TYPES: Record<string, string> = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".mjs": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".map": "application/json; charset=utf-8",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
+  ".webp": "image/webp",
+  ".ico": "image/x-icon",
+  ".woff": "font/woff",
+  ".woff2": "font/woff2",
+  ".ttf": "font/ttf",
+  ".txt": "text/plain; charset=utf-8",
+  ".wasm": "application/wasm",
+};
+
+function contentTypeFor(file: string): string {
+  return (
+    STATIC_MIME_TYPES[path.extname(file).toLowerCase()] ??
+    "application/octet-stream"
+  );
+}
+
+function safeDecode(value: string): string | null {
+  try {
+    const decoded = decodeURIComponent(value);
+    // Node 文件 API 不接受 NUL；对这类非法路径直接按不存在处理。
+    return decoded.includes("\0") ? null : decoded;
+  } catch {
+    return null;
+  }
+}
+
+/** resolved 必须等于 root 或位于 root 内，否则视为路径穿越。 */
+function isInsideRoot(root: string, resolved: string): boolean {
+  const normalizedRoot = path.resolve(root);
+  return (
+    resolved === normalizedRoot || resolved.startsWith(normalizedRoot + path.sep)
+  );
+}
+
+async function isFile(candidate: string): Promise<boolean> {
+  return stat(candidate)
+    .then((info) => info.isFile())
+    .catch(() => false);
+}
+
+/**
+ * 静态文件解析规则：
+ * 1. 命中文件直接返回；命中目录则尝试目录下的 index.html；
+ * 2. 未命中且路径没有扩展名时回退到根 index.html（前端 SPA 路由）；
+ * 3. 其余（带扩展名但文件不存在）返回 null → 404。
+ */
+async function resolveStaticFile(
+  root: string,
+  resolved: string,
+  decodedPath: string,
+): Promise<string | null> {
+  if (await isFile(resolved)) return resolved;
+
+  const directoryIndex = path.join(resolved, "index.html");
+  if (await isFile(directoryIndex)) return directoryIndex;
+
+  if (!path.extname(decodedPath)) {
+    const fallback = path.join(root, "index.html");
+    if (await isFile(fallback)) return fallback;
+  }
+
+  return null;
 }
