@@ -5,7 +5,7 @@ import type { DatabaseSync } from "node:sqlite";
  * 只有迁移事务提交成功后才记录版本，因此初始化失败时可以安全重试，
  * 不会把未完成的迁移误认为已经成功。
  */
-export const SESSION_SCHEMA_VERSION = 3;
+export const SESSION_SCHEMA_VERSION = 4;
 
 type Migration = {
   version: number;
@@ -192,6 +192,63 @@ const MIGRATIONS: readonly Migration[] = [
 
         CREATE INDEX idx_tool_calls_request
           ON tool_calls(request_id, tool_call_id);
+      `);
+    },
+  },
+  {
+    version: 4,
+    up(database) {
+      database.exec(`
+        -- 审批生命周期独立于工具执行审计：拒绝或过期的审批也必须可追溯，
+        -- 同时避免让 tool_calls 的执行状态承载 pending 语义。
+        CREATE TABLE approval_requests (
+          id TEXT PRIMARY KEY,
+          request_id TEXT NOT NULL,
+          tool_call_id TEXT NOT NULL,
+          tool_name TEXT NOT NULL,
+          tool_label TEXT NOT NULL,
+          toolset TEXT NOT NULL,
+          risk TEXT NOT NULL CHECK (
+            risk IN ('read', 'write', 'external', 'destructive')
+          ),
+          confirmation_level TEXT NOT NULL CHECK (
+            confirmation_level IN ('standard', 'strong')
+          ),
+          args_hash TEXT NOT NULL,
+          display_arguments TEXT NOT NULL,
+          session_id TEXT NOT NULL
+            REFERENCES sessions(id)
+            ON DELETE CASCADE,
+          conversation_id TEXT NOT NULL,
+          channel TEXT NOT NULL,
+          user_id TEXT NOT NULL,
+          -- 每次进程启动生成新的 owner；旧 owner 的 pending 记录会安全过期。
+          owner_id TEXT NOT NULL,
+          status TEXT NOT NULL CHECK (
+            status IN ('pending', 'approved', 'denied', 'expired', 'cancelled')
+          ),
+          requested_at INTEGER NOT NULL,
+          expires_at INTEGER NOT NULL,
+          resolved_at INTEGER,
+          resolved_by_session_id TEXT,
+          resolved_by_conversation_id TEXT,
+          resolved_by_channel TEXT,
+          resolved_by_user_id TEXT,
+          CHECK (expires_at > requested_at),
+          CHECK (
+            (status = 'pending' AND resolved_at IS NULL) OR
+            (status <> 'pending' AND resolved_at IS NOT NULL)
+          )
+        );
+
+        CREATE INDEX idx_approval_requests_status_expiry
+          ON approval_requests(status, expires_at);
+
+        CREATE INDEX idx_approval_requests_scope_requested
+          ON approval_requests(user_id, channel, conversation_id, requested_at DESC);
+
+        CREATE INDEX idx_approval_requests_request
+          ON approval_requests(request_id, tool_call_id);
       `);
     },
   },

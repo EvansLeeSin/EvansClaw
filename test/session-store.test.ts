@@ -68,6 +68,7 @@ test("initializes the structured schema and records migration version", () => {
         "messages_fts_trigram",
         "session_compactions",
         "tool_calls",
+        "approval_requests",
       ].every((name) => names.has(name)),
       true,
     );
@@ -75,7 +76,7 @@ test("initializes the structured schema and records migration version", () => {
       (database
         .prepare("SELECT MAX(version) AS version FROM schema_migrations")
         .get() as { version: number }).version,
-      3,
+      4,
     );
 
     const columns = database
@@ -91,7 +92,7 @@ test("initializes the structured schema and records migration version", () => {
   }
 });
 
-test("将已有 schema v2 数据库升级到 schema v3", () => {
+test("将已有 schema v2 数据库升级到 schema v4", () => {
   const fixture = createDatabaseFixture();
   try {
     const firstStore = new SqliteSessionStore(fixture.path);
@@ -99,8 +100,9 @@ test("将已有 schema v2 数据库升级到 schema v3", () => {
 
     const database = new DatabaseSync(fixture.path);
     database.exec(`
+      DROP TABLE approval_requests;
       DROP TABLE tool_calls;
-      DELETE FROM schema_migrations WHERE version = 3;
+      DELETE FROM schema_migrations WHERE version IN (3, 4);
     `);
     database.close();
 
@@ -112,7 +114,7 @@ test("将已有 schema v2 数据库升级到 schema v3", () => {
       (upgradedDatabase
         .prepare("SELECT MAX(version) AS version FROM schema_migrations")
         .get() as { version: number }).version,
-      3,
+      4,
     );
     assert.equal(
       (upgradedDatabase
@@ -129,6 +131,14 @@ test("将已有 schema v2 数据库升级到 schema v3", () => {
         )
         .get() as { name: string } | undefined)?.name,
       "tool_calls",
+    );
+    assert.equal(
+      (upgradedDatabase
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'approval_requests'",
+        )
+        .get() as { name: string } | undefined)?.name,
+      "approval_requests",
     );
     upgradedDatabase.close();
   } finally {

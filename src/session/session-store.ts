@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import {
@@ -5,6 +6,16 @@ import {
   type StatementSync,
 } from "node:sqlite";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import {
+  InMemoryApprovalStore,
+  normalizeApprovalLimit,
+  type ApprovalExpiryMode,
+  type ApprovalRecord,
+  type ApprovalRequest,
+  type ApprovalStore,
+  type ApprovalStoreFinish,
+  type ApprovalStoreListOptions,
+} from "../tools/approval-store.js";
 import {
   InMemoryToolAuditStore,
   normalizeAuditLimit,
@@ -133,6 +144,12 @@ function sleepSync(milliseconds: number): void {
   Atomics.wait(signal, 0, 0, milliseconds);
 }
 
+function validateApprovalTime(value: number, label: string): void {
+  if (!Number.isInteger(value) || value < 0) {
+    throw new Error(`审批${label}必须是非负整数。`);
+  }
+}
+
 type NormalizedCompaction = {
   summary: string;
   firstKeptSequence: number;
@@ -199,9 +216,12 @@ function parseCompactionUsage(
   }
 }
 
-export class InMemorySessionStore implements SessionStore, ToolAuditStore {
+export class InMemorySessionStore
+  implements SessionStore, ToolAuditStore, ApprovalStore
+{
   private readonly sessions = new Map<string, InMemorySession>();
   private readonly toolAuditStore = new InMemoryToolAuditStore();
+  private readonly approvalStore = new InMemoryApprovalStore();
   private nextCompactionId = 1;
 
   async getOrCreate(
@@ -321,6 +341,37 @@ export class InMemorySessionStore implements SessionStore, ToolAuditStore {
     options: ToolAuditListOptions = {},
   ): Promise<ToolAuditRecord[]> {
     return this.toolAuditStore.listToolCalls(options);
+  }
+
+  async create(request: ApprovalRequest): Promise<void> {
+    if (!this.sessions.has(request.context.sessionId)) {
+      throw new Error(`会话 ${request.context.sessionId} 不存在。`);
+    }
+    await this.approvalStore.create(request);
+  }
+
+  async finish(
+    approvalId: string,
+    update: ApprovalStoreFinish,
+  ): Promise<boolean> {
+    return this.approvalStore.finish(approvalId, update);
+  }
+
+  async expirePending(
+    now: number,
+    mode: ApprovalExpiryMode,
+  ): Promise<number> {
+    return this.approvalStore.expirePending(now, mode);
+  }
+
+  async get(approvalId: string): Promise<ApprovalRecord | null> {
+    return this.approvalStore.get(approvalId);
+  }
+
+  async list(
+    options: ApprovalStoreListOptions = {},
+  ): Promise<ApprovalRecord[]> {
+    return this.approvalStore.list(options);
   }
 
   async search(
@@ -459,14 +510,42 @@ type ToolCallRow = {
   finished_at: number | null;
 };
 
+type ApprovalRequestRow = {
+  id: string;
+  request_id: string;
+  tool_call_id: string;
+  tool_name: string;
+  tool_label: string;
+  toolset: string;
+  risk: ApprovalRecord["risk"];
+  confirmation_level: ApprovalRecord["confirmationLevel"];
+  args_hash: string;
+  display_arguments: string;
+  session_id: string;
+  conversation_id: string;
+  channel: string;
+  user_id: string;
+  requested_at: number;
+  expires_at: number;
+  status: ApprovalRecord["status"];
+  resolved_at: number | null;
+  resolved_by_session_id: string | null;
+  resolved_by_conversation_id: string | null;
+  resolved_by_channel: string | null;
+  resolved_by_user_id: string | null;
+};
+
 /**
  * 基于 SQLite 的结构化会话存储。
  *
  * Node.js 22.19+ 内置 node:sqlite，因此不需要额外安装原生 npm 依赖。
  * messages 表是唯一可信的数据来源；FTS5 表是由 SQLite 触发器维护的派生索引。
  */
-export class SqliteSessionStore implements SessionStore, ToolAuditStore {
+export class SqliteSessionStore
+  implements SessionStore, ToolAuditStore, ApprovalStore
+{
   private readonly database: DatabaseSync;
+  private readonly approvalOwnerId = randomUUID();
   private readonly getSessionStatement: StatementSync;
   private readonly insertSessionStatement: StatementSync;
   private readonly updateSessionMetadataStatement: StatementSync;
@@ -483,6 +562,12 @@ export class SqliteSessionStore implements SessionStore, ToolAuditStore {
   private readonly resetSessionStatement: StatementSync;
   private readonly insertToolCallStatement: StatementSync;
   private readonly finishToolCallStatement: StatementSync;
+  private readonly insertApprovalStatement: StatementSync;
+  private readonly finishApprovalStatement: StatementSync;
+  private readonly expireDueApprovalStatement: StatementSync;
+  private readonly expireAllApprovalStatement: StatementSync;
+  private readonly getApprovalStatement: StatementSync;
+  private readonly recoverApprovalStatement: StatementSync;
 
   constructor(databasePath: string) {
     mkdirSync(dirname(databasePath), { recursive: true });
@@ -639,6 +724,86 @@ export class SqliteSessionStore implements SessionStore, ToolAuditStore {
         finished_at = ?
       WHERE id = ? AND status = 'started'
     `);
+    this.insertApprovalStatement = this.database.prepare(`
+      INSERT INTO approval_requests (
+        id,
+        request_id,
+        tool_call_id,
+        tool_name,
+        tool_label,
+        toolset,
+        risk,
+        confirmation_level,
+        args_hash,
+        display_arguments,
+        session_id,
+        conversation_id,
+        channel,
+        user_id,
+        owner_id,
+        status,
+        requested_at,
+        expires_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+    `);
+    this.finishApprovalStatement = this.database.prepare(`
+      UPDATE approval_requests
+      SET
+        status = ?,
+        resolved_at = ?,
+        resolved_by_session_id = ?,
+        resolved_by_conversation_id = ?,
+        resolved_by_channel = ?,
+        resolved_by_user_id = ?
+      WHERE id = ? AND status = 'pending'
+    `);
+    this.expireDueApprovalStatement = this.database.prepare(`
+      UPDATE approval_requests
+      SET status = 'expired', resolved_at = ?
+      WHERE status = 'pending' AND expires_at <= ?
+    `);
+    this.expireAllApprovalStatement = this.database.prepare(`
+      UPDATE approval_requests
+      SET status = 'expired', resolved_at = ?
+      WHERE status = 'pending'
+    `);
+    this.getApprovalStatement = this.database.prepare(`
+      SELECT
+        id,
+        request_id,
+        tool_call_id,
+        tool_name,
+        tool_label,
+        toolset,
+        risk,
+        confirmation_level,
+        args_hash,
+        display_arguments,
+        session_id,
+        conversation_id,
+        channel,
+        user_id,
+        requested_at,
+        expires_at,
+        status,
+        resolved_at,
+        resolved_by_session_id,
+        resolved_by_conversation_id,
+        resolved_by_channel,
+        resolved_by_user_id
+      FROM approval_requests
+      WHERE id = ?
+    `);
+    this.recoverApprovalStatement = this.database.prepare(`
+      UPDATE approval_requests
+      SET status = 'expired', resolved_at = ?
+      WHERE status = 'pending' AND owner_id <> ?
+    `);
+
+    // 新进程只允许处理自己创建的 pending 请求；旧 owner 遗留的请求必须过期。
+    this.withWriteTransaction(() => {
+      this.recoverApprovalStatement.run(Date.now(), this.approvalOwnerId);
+    });
   }
 
   async getOrCreate(
@@ -845,6 +1010,144 @@ export class SqliteSessionStore implements SessionStore, ToolAuditStore {
     return rows.map((row) => this.toToolAuditRecord(row));
   }
 
+  async create(request: ApprovalRequest): Promise<void> {
+    this.withWriteTransaction(() => {
+      const session = this.getSessionStatement.get(request.context.sessionId);
+      if (!session) {
+        throw new Error(`会话 ${request.context.sessionId} 不存在。`);
+      }
+      this.insertApprovalStatement.run(
+        request.approvalId,
+        request.requestId,
+        request.toolCallId,
+        request.toolName,
+        request.toolLabel,
+        request.toolset,
+        request.risk,
+        request.confirmationLevel,
+        request.argsHash,
+        request.displayArguments,
+        request.context.sessionId,
+        request.context.conversationId,
+        request.context.channel,
+        request.context.userId,
+        this.approvalOwnerId,
+        request.requestedAt,
+        request.expiresAt,
+      );
+    });
+  }
+
+  async finish(
+    approvalId: string,
+    update: ApprovalStoreFinish,
+  ): Promise<boolean> {
+    const resolvedBy = update.resolvedBy;
+    return this.withWriteTransaction(() => {
+      const result = this.finishApprovalStatement.run(
+        update.status,
+        update.resolvedAt,
+        resolvedBy?.sessionId ?? null,
+        resolvedBy?.conversationId ?? null,
+        resolvedBy?.channel ?? null,
+        resolvedBy?.userId ?? null,
+        approvalId,
+      );
+      return Number(result.changes) === 1;
+    });
+  }
+
+  async expirePending(
+    now: number,
+    mode: ApprovalExpiryMode,
+  ): Promise<number> {
+    validateApprovalTime(now, "过期时间");
+    if (mode !== "due" && mode !== "all") {
+      throw new Error(`未知的审批过期模式：${mode}`);
+    }
+
+    return this.withWriteTransaction(() => {
+      const result =
+        mode === "all"
+          ? this.expireAllApprovalStatement.run(now)
+          : this.expireDueApprovalStatement.run(now, now);
+      return Number(result.changes);
+    });
+  }
+
+  async get(approvalId: string): Promise<ApprovalRecord | null> {
+    const row = this.getApprovalStatement.get(approvalId) as
+      | ApprovalRequestRow
+      | undefined;
+    return row ? this.toApprovalRecord(row) : null;
+  }
+
+  async list(
+    options: ApprovalStoreListOptions = {},
+  ): Promise<ApprovalRecord[]> {
+    const where: string[] = [];
+    const parameters: Array<string | number> = [];
+    if (options.sessionId) {
+      where.push("session_id = ?");
+      parameters.push(options.sessionId);
+    }
+    if (options.conversationId) {
+      where.push("conversation_id = ?");
+      parameters.push(options.conversationId);
+    }
+    if (options.channel) {
+      where.push("channel = ?");
+      parameters.push(options.channel);
+    }
+    if (options.userId) {
+      where.push("user_id = ?");
+      parameters.push(options.userId);
+    }
+    if (options.toolName) {
+      where.push("tool_name = ?");
+      parameters.push(options.toolName);
+    }
+    if (options.status) {
+      where.push("status = ?");
+      parameters.push(options.status);
+    }
+
+    const limit = normalizeApprovalLimit(options.limit);
+    parameters.push(limit);
+    const rows = this.database
+      .prepare(`
+        SELECT
+          id,
+          request_id,
+          tool_call_id,
+          tool_name,
+          tool_label,
+          toolset,
+          risk,
+          confirmation_level,
+          args_hash,
+          display_arguments,
+          session_id,
+          conversation_id,
+          channel,
+          user_id,
+          requested_at,
+          expires_at,
+          status,
+          resolved_at,
+          resolved_by_session_id,
+          resolved_by_conversation_id,
+          resolved_by_channel,
+          resolved_by_user_id
+        FROM approval_requests
+        ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
+        ORDER BY requested_at DESC, id DESC
+        LIMIT ?
+      `)
+      .all(...parameters) as unknown as ApprovalRequestRow[];
+    return rows.map((row) => this.toApprovalRecord(row));
+  }
+
   async search(
     query: string,
     options: SessionSearchOptions = {},
@@ -981,6 +1284,45 @@ export class SqliteSessionStore implements SessionStore, ToolAuditStore {
       updatedAt: Number(row.updated_at),
       parentSessionId: row.parent_session_id,
       messageCount: Number(row.message_count),
+    };
+  }
+
+  private toApprovalRecord(row: ApprovalRequestRow): ApprovalRecord {
+    const hasResolvedBy =
+      row.resolved_by_session_id !== null &&
+      row.resolved_by_conversation_id !== null &&
+      row.resolved_by_channel !== null &&
+      row.resolved_by_user_id !== null;
+
+    return {
+      approvalId: row.id,
+      requestId: row.request_id,
+      toolCallId: row.tool_call_id,
+      toolName: row.tool_name,
+      toolLabel: row.tool_label,
+      toolset: row.toolset,
+      risk: row.risk,
+      confirmationLevel: row.confirmation_level,
+      argsHash: row.args_hash,
+      displayArguments: row.display_arguments,
+      context: {
+        sessionId: row.session_id,
+        conversationId: row.conversation_id,
+        channel: row.channel,
+        userId: row.user_id,
+      },
+      requestedAt: Number(row.requested_at),
+      expiresAt: Number(row.expires_at),
+      status: row.status,
+      resolvedAt: row.resolved_at === null ? null : Number(row.resolved_at),
+      resolvedBy: hasResolvedBy
+        ? {
+            sessionId: row.resolved_by_session_id!,
+            conversationId: row.resolved_by_conversation_id!,
+            channel: row.resolved_by_channel!,
+            userId: row.resolved_by_user_id!,
+          }
+        : null,
     };
   }
 
