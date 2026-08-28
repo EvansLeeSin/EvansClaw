@@ -4,12 +4,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { Type } from "typebox";
+import { InMemoryApprovalBroker } from "../src/tools/approval-broker.js";
 import { InMemoryToolAuditStore } from "../src/tools/tool-audit.js";
 import {
   createCurrentTimeTool,
   createSessionSearchTool,
 } from "../src/tools/builtin-tools.js";
-import { ToolRegistry } from "../src/tools/tool-registry.js";
+import {
+  ToolAuthorizationError,
+  ToolRegistry,
+} from "../src/tools/tool-registry.js";
 import { InMemorySessionStore, SqliteSessionStore } from "../src/session/session-store.js";
 
 const context = {
@@ -121,6 +125,156 @@ test("ToolRegistry 在执行前校验参数，并把超时记录为失败", asyn
   const records = await audit.listToolCalls({ toolName: "slow_test" });
   assert.equal(records.length, 1);
   assert.equal(records[0]?.status, "failed");
+});
+
+function createWriteDefinition(onExecute: () => void) {
+  const parameters = Type.Object({
+    token: Type.String(),
+    note: Type.String(),
+  });
+  return {
+    name: "write_test",
+    label: "写入测试",
+    description: "需要审批的写入测试工具。",
+    parameters,
+    toolset: "core",
+    risk: "write" as const,
+    source: "builtin" as const,
+    execute: async (params: { token: string; note: string }) => {
+      onExecute();
+      return {
+        content: [{ type: "text" as const, text: `写入：${params.note}` }],
+      };
+    },
+  };
+}
+
+test("ToolRegistry 默认策略拒绝不可信身份的敏感工具", async () => {
+  let called = false;
+  const registry = new ToolRegistry();
+  registry.register(createWriteDefinition(() => { called = true; }));
+  const tool = registry.createAgentTools(context)[0];
+  assert.ok(tool);
+
+  await assert.rejects(
+    () => tool.execute("deny-call", { token: "secret", note: "no" }, new AbortController().signal),
+    (error: unknown) =>
+      error instanceof ToolAuthorizationError && error.code === "policy_denied",
+  );
+  assert.equal(called, false);
+});
+
+test("ToolRegistry 在批准前不执行写入，并在批准后记录审计", async () => {
+  let called = false;
+  const broker = new InMemoryApprovalBroker({ createId: () => "approval-write" });
+  const audit = new InMemoryToolAuditStore();
+  const events = [] as Array<import("../src/tools/approval-broker.js").ApprovalEvent>;
+  broker.subscribe((event) => events.push(event));
+  const registry = new ToolRegistry({
+    auditStore: audit,
+    approvalBroker: broker,
+    identity: { authenticated: true },
+  });
+  registry.register(createWriteDefinition(() => { called = true; }));
+  const tool = registry.createAgentTools(context)[0];
+  assert.ok(tool);
+
+  const pending = tool.execute(
+    "write-call",
+    { token: "secret", note: "hello" },
+    new AbortController().signal,
+  );
+  const requested = events.find((event) => event.type === "requested");
+  assert.ok(requested && requested.type === "requested");
+  assert.equal(called, false);
+  assert.match(requested.request.displayArguments, /\[已隐藏\]/);
+  assert.doesNotMatch(requested.request.displayArguments, /secret/);
+
+  assert.equal(await broker.resolve({
+    approvalId: requested.request.approvalId,
+    decision: "approve",
+    toolName: requested.request.toolName,
+    argsHash: requested.request.argsHash,
+    actor: context,
+  }), true);
+  const result = await pending;
+  assert.match(textOf(result), /hello/);
+  assert.equal(called, true);
+  const records = await audit.listToolCalls({ toolName: "write_test" });
+  assert.equal(records.length, 1);
+  assert.equal(records[0]?.status, "succeeded");
+  await broker.close();
+});
+
+test("ToolRegistry 没有审批 Broker 时对 ask 决策 fail-closed", async () => {
+  let called = false;
+  const audit = new InMemoryToolAuditStore();
+  const registry = new ToolRegistry({
+    auditStore: audit,
+    identity: { authenticated: true },
+  });
+  registry.register(createWriteDefinition(() => { called = true; }));
+  const tool = registry.createAgentTools(context)[0];
+  assert.ok(tool);
+
+  await assert.rejects(
+    () => tool.execute("missing-broker", { token: "secret", note: "no" }, new AbortController().signal),
+    (error: unknown) =>
+      error instanceof ToolAuthorizationError && error.code === "approval_unavailable",
+  );
+  assert.equal(called, false);
+  assert.equal((await audit.listToolCalls()).length, 0);
+});
+
+test("ToolRegistry 在批准后发现策略变化时拒绝执行", async () => {
+  let called = false;
+  let evaluations = 0;
+  const broker = new InMemoryApprovalBroker({ createId: () => "approval-policy-change" });
+  const registry = new ToolRegistry({
+    approvalBroker: broker,
+    identity: { authenticated: true },
+    policy: {
+      evaluate: () => {
+        evaluations += 1;
+        return evaluations === 1
+          ? {
+              action: "ask" as const,
+              ruleId: "custom.ask",
+              reason: "需要审批",
+              confirmation: { level: "standard" as const, expiresInMs: 60_000 },
+            }
+          : {
+              action: "deny" as const,
+              ruleId: "custom.changed",
+              reason: "策略已经收紧",
+            };
+      },
+    },
+  });
+  registry.register(createWriteDefinition(() => { called = true; }));
+  const tool = registry.createAgentTools(context)[0];
+  assert.ok(tool);
+  const pending = tool.execute(
+    "policy-change-call",
+    { token: "secret", note: "no" },
+    new AbortController().signal,
+  );
+  const request = broker.listPending()[0];
+  assert.ok(request);
+  await broker.resolve({
+    approvalId: request.approvalId,
+    decision: "approve",
+    toolName: request.toolName,
+    argsHash: request.argsHash,
+    actor: context,
+  });
+  await assert.rejects(
+    () => pending,
+    (error: unknown) =>
+      error instanceof ToolAuthorizationError && error.code === "policy_changed",
+  );
+  assert.equal(called, false);
+  await broker.close();
 });
 
 test("内置会话搜索严格限制在当前会话范围", async () => {
