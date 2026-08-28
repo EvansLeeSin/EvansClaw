@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { ToolConfirmationLevel } from "./tool-policy.js";
-import type { ToolContextBase, ToolRisk } from "./tool-types.js";
+import type { ApprovalStore } from "./approval-store.js";
+import type { ToolRisk } from "./tool-types.js";
 
 export type ApprovalDecision = "approve" | "deny";
 export type ApprovalOutcome =
@@ -80,12 +81,12 @@ export interface ApprovalBroker {
     input: ApprovalRequestInput,
     signal?: AbortSignal,
   ): Promise<ApprovalResult>;
-  resolve(input: ApprovalResolutionInput): boolean;
-  cancel(approvalId: string): boolean;
+  resolve(input: ApprovalResolutionInput): Promise<boolean>;
+  cancel(approvalId: string): Promise<boolean>;
   subscribe(listener: ApprovalEventListener): () => void;
   get(approvalId: string): ApprovalRequest | undefined;
   listPending(): ApprovalRequest[];
-  close(): void;
+  close(): Promise<void>;
 }
 
 export interface InMemoryApprovalBrokerOptions {
@@ -93,6 +94,8 @@ export interface InMemoryApprovalBrokerOptions {
   now?: () => number;
   /** 可注入 ID 生成器以测试重复 ID 等异常路径。 */
   createId?: () => string;
+  /** 可选的持久化边界；写入成功后才发布 requested/resolved 事件。 */
+  approvalStore?: ApprovalStore;
 }
 
 type PendingApproval = {
@@ -100,25 +103,31 @@ type PendingApproval = {
   settle: (result: ApprovalResult) => void;
   timer: ReturnType<typeof setTimeout>;
   detachAbort: () => void;
+  settling: boolean;
 };
 
 /**
  * 单进程审批等待器。
  *
- * Broker 只管理一次性请求的生命周期，不判断风险、不执行工具，也不把
- * 审批结果持久化。后续的 SQLite 层可以记录这里发出的 requested/resolved
- * 事件；进程重启时未完成的 Promise 自然消失，因此不会被误认为已批准。
+ * Broker 只管理一次性请求的生命周期，不判断风险、不执行工具。传入
+ * approvalStore 时，pending 记录会先持久化，且只有终态写入成功后才会
+ * 结束等待；没有 Store 时仍可作为纯内存实现使用。
  */
 export class InMemoryApprovalBroker implements ApprovalBroker {
   private readonly pending = new Map<string, PendingApproval>();
+  private readonly reservedIds = new Set<string>();
+  private readonly initializing = new Set<Promise<void>>();
+  private readonly inFlight = new Set<Promise<unknown>>();
   private readonly listeners = new Set<ApprovalEventListener>();
   private readonly now: () => number;
   private readonly createId: () => string;
+  private readonly approvalStore: ApprovalStore | undefined;
   private closed = false;
 
   constructor(options: InMemoryApprovalBrokerOptions = {}) {
     this.now = options.now ?? Date.now;
     this.createId = options.createId ?? randomUUID;
+    this.approvalStore = options.approvalStore;
   }
 
   request(
@@ -132,7 +141,7 @@ export class InMemoryApprovalBroker implements ApprovalBroker {
 
     const requestedAt = this.now();
     const approvalId = this.createId();
-    if (!hasText(approvalId) || this.pending.has(approvalId)) {
+    if (!hasText(approvalId) || this.reservedIds.has(approvalId)) {
       throw new Error(`审批 ID 无效或重复：${approvalId}`);
     }
 
@@ -158,27 +167,32 @@ export class InMemoryApprovalBroker implements ApprovalBroker {
       );
     }
 
-    return new Promise<ApprovalResult>((settle) => {
-      const pending: PendingApproval = {
-        request,
-        settle,
-        timer: setTimeout(
-          () => this.finish(approvalId, "expired"),
-          input.expiresInMs,
-        ),
-        detachAbort: () => undefined,
-      };
-      const onAbort = () => this.finish(approvalId, "cancelled");
-      if (signal) {
-        signal.addEventListener("abort", onAbort, { once: true });
-        pending.detachAbort = () => signal.removeEventListener("abort", onAbort);
-      }
-      this.pending.set(approvalId, pending);
-      this.emit({ type: "requested", request });
+    this.reservedIds.add(approvalId);
+    if (!this.approvalStore) {
+      return this.createPending(request, signal);
+    }
+
+    let settle!: (result: ApprovalResult) => void;
+    let reject!: (reason: unknown) => void;
+    const resultPromise = new Promise<ApprovalResult>((resolve, fail) => {
+      settle = resolve;
+      reject = fail;
     });
+    const initialization = this.initializePersistent(
+      request,
+      signal,
+      settle,
+      reject,
+    );
+    this.initializing.add(initialization);
+    void initialization.then(
+      () => this.initializing.delete(initialization),
+      () => this.initializing.delete(initialization),
+    );
+    return resultPromise;
   }
 
-  resolve(input: ApprovalResolutionInput): boolean {
+  resolve(input: ApprovalResolutionInput): Promise<boolean> {
     if (
       this.closed ||
       !input ||
@@ -186,10 +200,10 @@ export class InMemoryApprovalBroker implements ApprovalBroker {
       !isApprovalDecision(input.decision) ||
       !isActor(input.actor)
     ) {
-      return false;
+      return Promise.resolve(false);
     }
     const pending = this.pending.get(input.approvalId);
-    if (!pending) return false;
+    if (!pending) return Promise.resolve(false);
 
     // approvalId 之外再次校验操作者、工具名和参数指纹；任一字段不匹配
     // 都不改变 pending 状态，让真正的持有者仍可继续解决该请求。
@@ -198,21 +212,21 @@ export class InMemoryApprovalBroker implements ApprovalBroker {
       input.argsHash !== pending.request.argsHash ||
       !sameActor(input.actor, pending.request.context)
     ) {
-      return false;
+      return Promise.resolve(false);
     }
 
-    this.finish(
-      input.approvalId,
-      input.decision === "approve" ? "approved" : "denied",
-      input.actor,
+    return this.track(
+      this.finish(
+        input.approvalId,
+        input.decision === "approve" ? "approved" : "denied",
+        input.actor,
+      ),
     );
-    return true;
   }
 
-  cancel(approvalId: string): boolean {
-    if (this.closed || !this.pending.has(approvalId)) return false;
-    this.finish(approvalId, "cancelled");
-    return true;
+  cancel(approvalId: string): Promise<boolean> {
+    if (this.closed) return Promise.resolve(false);
+    return this.track(this.finish(approvalId, "cancelled"));
   }
 
   subscribe(listener: ApprovalEventListener): () => void {
@@ -231,16 +245,143 @@ export class InMemoryApprovalBroker implements ApprovalBroker {
       .sort((left, right) => left.requestedAt - right.requestedAt);
   }
 
-  close(): void {
+  async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
-    for (const approvalId of [...this.pending.keys()]) {
-      this.finish(approvalId, "cancelled");
+
+    // 等待尚未完成的落库，再取消已公开的 pending；这样关闭数据库时，
+    // 请求不会停留在一次未完成的异步写入中。
+    while (this.initializing.size > 0 || this.inFlight.size > 0) {
+      const operations = [
+        ...this.initializing,
+        ...this.inFlight,
+      ] as Promise<unknown>[];
+      if (operations.length > 0) await Promise.allSettled(operations);
     }
+
+    const cancellations = [...this.pending.keys()].map((approvalId) =>
+      this.finish(approvalId, "cancelled"),
+    );
+    await Promise.all(cancellations);
     this.listeners.clear();
   }
 
+  private createPending(
+    request: ApprovalRequest,
+    signal: AbortSignal | undefined,
+  ): Promise<ApprovalResult> {
+    return new Promise<ApprovalResult>((settle) => {
+      this.installPending(request, signal, settle);
+    });
+  }
+
+  private installPending(
+    request: ApprovalRequest,
+    signal: AbortSignal | undefined,
+    settle: (result: ApprovalResult) => void,
+  ): void {
+    if (signal?.aborted || this.closed || this.now() >= request.expiresAt) {
+      const outcome =
+        signal?.aborted || this.closed ? "cancelled" : "expired";
+      this.reservedIds.delete(request.approvalId);
+      settle(this.result(request, outcome, undefined, this.now()));
+      return;
+    }
+
+    const pending: PendingApproval = {
+      request,
+      settle,
+      timer: setTimeout(
+        () => void this.track(this.finish(request.approvalId, "expired")),
+        Math.max(0, request.expiresAt - this.now()),
+      ),
+      detachAbort: () => undefined,
+      settling: false,
+    };
+    const onAbort = () => void this.track(this.finish(request.approvalId, "cancelled"));
+    if (signal) {
+      signal.addEventListener("abort", onAbort, { once: true });
+      pending.detachAbort = () => signal.removeEventListener("abort", onAbort);
+      if (signal.aborted) {
+        pending.detachAbort();
+        clearTimeout(pending.timer);
+        this.reservedIds.delete(request.approvalId);
+        settle(this.result(request, "cancelled", undefined, this.now()));
+        return;
+      }
+    }
+
+    this.pending.set(request.approvalId, pending);
+    this.emit({ type: "requested", request });
+  }
+
+  private async initializePersistent(
+    request: ApprovalRequest,
+    signal: AbortSignal | undefined,
+    settle: (result: ApprovalResult) => void,
+    reject: (reason: unknown) => void,
+  ): Promise<void> {
+    try {
+      await this.approvalStore!.create(request);
+      if (signal?.aborted || this.closed || this.now() >= request.expiresAt) {
+        const outcome =
+          signal?.aborted || this.closed ? "cancelled" : "expired";
+        await this.persistFinish(request.approvalId, outcome);
+        this.reservedIds.delete(request.approvalId);
+        settle(this.result(request, outcome, undefined, this.now()));
+        return;
+      }
+      this.installPending(request, signal, settle);
+    } catch (error) {
+      // Store 创建失败时不发布 requested，也不保留可批准的内存请求。
+      this.reservedIds.delete(request.approvalId);
+      reject(error);
+    }
+  }
+
   private finish(
+    approvalId: string,
+    outcome: ApprovalOutcome,
+    resolvedBy?: ApprovalActor,
+  ): Promise<boolean> {
+    const pending = this.pending.get(approvalId);
+    if (!pending || pending.settling) return Promise.resolve(false);
+    pending.settling = true;
+
+    return (async () => {
+      const persisted = await this.persistFinish(
+        approvalId,
+        outcome,
+        resolvedBy,
+      );
+      if (!persisted) {
+        // 数据库拒绝或无法确认终态时，内存侧也只能取消，绝不返回 approved。
+        this.finishInMemory(approvalId, "cancelled");
+        return false;
+      }
+      this.finishInMemory(approvalId, outcome, resolvedBy);
+      return true;
+    })();
+  }
+
+  private async persistFinish(
+    approvalId: string,
+    outcome: ApprovalOutcome,
+    resolvedBy?: ApprovalActor,
+  ): Promise<boolean> {
+    if (!this.approvalStore) return true;
+    try {
+      return await this.approvalStore.finish(approvalId, {
+        status: outcome,
+        resolvedAt: this.now(),
+        resolvedBy,
+      });
+    } catch {
+      return false;
+    }
+  }
+
+  private finishInMemory(
     approvalId: string,
     outcome: ApprovalOutcome,
     resolvedBy?: ApprovalActor,
@@ -249,6 +390,7 @@ export class InMemoryApprovalBroker implements ApprovalBroker {
     if (!pending) return;
 
     this.pending.delete(approvalId);
+    this.reservedIds.delete(approvalId);
     clearTimeout(pending.timer);
     pending.detachAbort();
     const result = this.result(
@@ -274,6 +416,15 @@ export class InMemoryApprovalBroker implements ApprovalBroker {
       resolvedAt,
       resolvedBy: resolvedBy ? Object.freeze({ ...resolvedBy }) : undefined,
     });
+  }
+
+  private track<T>(operation: Promise<T>): Promise<T> {
+    this.inFlight.add(operation);
+    void operation.then(
+      () => this.inFlight.delete(operation),
+      () => this.inFlight.delete(operation),
+    );
+    return operation;
   }
 
   private emit(event: ApprovalEvent): void {

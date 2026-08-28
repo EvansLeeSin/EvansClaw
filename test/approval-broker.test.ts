@@ -48,7 +48,7 @@ test("Approval Broker 发布请求并只接受匹配绑定的批准", async () =
   assert.equal(broker.listPending().length, 1);
 
   assert.equal(
-    broker.resolve({
+    await broker.resolve({
       approvalId: "approval-1",
       decision: "approve",
       toolName: "write_note",
@@ -60,7 +60,7 @@ test("Approval Broker 发布请求并只接受匹配绑定的批准", async () =
   assert.equal(broker.listPending().length, 1);
 
   assert.equal(
-    broker.resolve({
+    await broker.resolve({
       approvalId: "approval-1",
       decision: "approve",
       toolName: "write_note",
@@ -81,7 +81,7 @@ test("Approval Broker 发布请求并只接受匹配绑定的批准", async () =
   );
 
   unsubscribe();
-  broker.close();
+  await broker.close();
 });
 
 test("Approval Broker 严格绑定操作者，错误操作者不会消耗请求", async () => {
@@ -91,7 +91,7 @@ test("Approval Broker 严格绑定操作者，错误操作者不会消耗请求"
   assert.ok(request);
 
   assert.equal(
-    broker.resolve({
+    await broker.resolve({
       approvalId: request.approvalId,
       decision: "approve",
       toolName: request.toolName,
@@ -103,7 +103,7 @@ test("Approval Broker 严格绑定操作者，错误操作者不会消耗请求"
   assert.equal(broker.get(request.approvalId)?.toolCallId, "call-2");
 
   assert.equal(
-    broker.resolve({
+    await broker.resolve({
       approvalId: request.approvalId,
       decision: "deny",
       toolName: request.toolName,
@@ -113,7 +113,7 @@ test("Approval Broker 严格绑定操作者，错误操作者不会消耗请求"
     true,
   );
   assert.equal((await pending).outcome, "denied");
-  broker.close();
+  await broker.close();
 });
 
 test("Approval Broker 的取消、AbortSignal 和 close 都不会批准工具", async () => {
@@ -125,9 +125,9 @@ test("Approval Broker 的取消、AbortSignal 和 close 都不会批准工具", 
   });
 
   const cancelled = broker.request(input({ toolCallId: "cancel-call" }));
-  assert.equal(broker.cancel("approval-1"), true);
+  assert.equal(await broker.cancel("approval-1"), true);
   assert.equal((await cancelled).outcome, "cancelled");
-  assert.equal(broker.cancel("approval-1"), false);
+  assert.equal(await broker.cancel("approval-1"), false);
 
   const controller = new AbortController();
   const aborted = broker.request(
@@ -138,7 +138,7 @@ test("Approval Broker 的取消、AbortSignal 和 close 都不会批准工具", 
   assert.equal((await aborted).outcome, "cancelled");
 
   const closed = broker.request(input({ toolCallId: "close-call" }));
-  broker.close();
+  await broker.close();
   assert.equal((await closed).outcome, "cancelled");
   assert.equal(broker.listPending().length, 0);
   assert.throws(() => broker.request(input()), /已关闭/);
@@ -151,7 +151,7 @@ test("审批请求到期后返回 expired，且之后不能再次解决", async 
 
   assert.equal(result.outcome, "expired");
   assert.equal(
-    broker.resolve({
+    await broker.resolve({
       approvalId: "approval-expire",
       decision: "approve",
       toolName: "write_note",
@@ -160,7 +160,7 @@ test("审批请求到期后返回 expired，且之后不能再次解决", async 
     }),
     false,
   );
-  broker.close();
+  await broker.close();
 });
 
 test("已取消的 AbortSignal 不会发布可批准的 pending 请求", async () => {
@@ -174,7 +174,7 @@ test("已取消的 AbortSignal 不会发布可批准的 pending 请求", async (
   assert.equal(result.outcome, "cancelled");
   assert.equal(events.length, 0);
   assert.equal(broker.listPending().length, 0);
-  broker.close();
+  await broker.close();
 });
 
 test("Approval Broker 拒绝无效请求和重复 ID", () => {
@@ -186,9 +186,10 @@ test("Approval Broker 拒绝无效请求和重复 ID", () => {
 
   const first = broker.request(input());
   assert.throws(() => broker.request(input()), /无效或重复/);
-  broker.cancel("same-id");
-  return first.then((result) => {
+  return broker.cancel("same-id").then(async (cancelled) => {
+    assert.equal(cancelled, true);
+    const result = await first;
     assert.equal(result.outcome, "cancelled");
-    broker.close();
+    await broker.close();
   });
 });
