@@ -51,6 +51,12 @@ async function main(): Promise<void> {
   const sessionId =
     process.env.EVANSCLAW_WEB_SESSION_ID ?? DEFAULT_WEB_SESSION_ID;
 
+  if (!isLoopbackHost(host)) {
+    console.warn(
+      "警告：Web Gateway 未启用认证，当前监听地址不是本机回环地址；仅建议在可信网络中使用。",
+    );
+  }
+
   // 静态目录属于启动配置，先于数据库/Agent 运行时校验，失败时不遗留资源。
   const staticDir = await resolveStaticDir();
   const runtime = await createChatRuntime({
@@ -58,6 +64,8 @@ async function main(): Promise<void> {
     conversationId: sessionId,
     channel: "web",
     userId: "local",
+    // 当前 Web Gateway 是单会话个人入口；后续多用户适配器不能继承此信任。
+    authenticated: true,
   });
   const gateway = new WebGateway({
     chat: runtime.chat,
@@ -77,7 +85,7 @@ async function main(): Promise<void> {
     try {
       await gateway.close();
     } finally {
-      runtime.close();
+      await runtime.close();
     }
   };
 
@@ -98,9 +106,14 @@ async function main(): Promise<void> {
     }
     console.log("默认仅监听本机；可通过 EVANSCLAW_WEB_HOST 修改。\n");
   } catch (error) {
-    runtime.close();
+    await runtime.close();
     throw error;
   }
+}
+
+function isLoopbackHost(host: string): boolean {
+  const normalized = host.trim().toLowerCase();
+  return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1";
 }
 
 function parsePort(value: string | undefined, fallback: number): number {

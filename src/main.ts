@@ -13,6 +13,8 @@ async function main(): Promise<void> {
     conversationId: "personal",
     channel: "cli",
     userId: "local",
+    // CLI 是用户直接控制的本机交互入口；未来远程/多用户适配器必须显式声明身份。
+    authenticated: true,
   });
 
   try {
@@ -54,7 +56,7 @@ async function main(): Promise<void> {
       readline.close();
     }
   } finally {
-    runtime.close();
+    await runtime.close();
   }
 }
 

@@ -17,6 +17,7 @@ import {
 import { SkillPromptBuilder } from "../skills/skill-prompt.js";
 import { SkillRegistry } from "../skills/skill-registry.js";
 import { createBuiltinTools } from "../tools/builtin-tools.js";
+import { InMemoryApprovalBroker } from "../tools/approval-broker.js";
 import { ToolRegistry } from "../tools/tool-registry.js";
 
 const projectRoot = resolve(import.meta.dirname, "../..");
@@ -27,6 +28,8 @@ export interface ChatRuntimeOptions {
   conversationId?: string;
   channel: string;
   userId: string;
+  /** 当前入口是否代表已确认的本地用户；默认不可信。 */
+  authenticated?: boolean;
 }
 
 /**
@@ -40,7 +43,8 @@ export interface ChatRuntime {
   readonly sessionStore: SqliteSessionStore;
   readonly skillRegistry: SkillRegistry;
   readonly toolRegistry: ToolRegistry;
-  close(): void;
+  readonly approvalBroker: InMemoryApprovalBroker;
+  close(): Promise<void>;
 }
 
 export async function createChatRuntime(
@@ -49,8 +53,15 @@ export async function createChatRuntime(
   const sessionStore = new SqliteSessionStore(
     options.databasePath ?? resolve(projectRoot, "data", "evansclaw.sqlite"),
   );
+  let approvalBroker: InMemoryApprovalBroker | undefined;
 
   try {
+    // 审批记录与会话、工具审计共用同一个 SQLite 生命周期；Broker 本身仍只
+    // 负责并发等待和事件，所有可恢复状态由 ApprovalStore 负责。
+    approvalBroker = new InMemoryApprovalBroker({
+      approvalStore: sessionStore,
+    });
+
     const skillRegistry = new SkillRegistry([
       {
         path: resolve(projectRoot, "skills"),
@@ -75,7 +86,11 @@ export async function createChatRuntime(
       userId: options.userId,
       model: config.model,
     });
-    const toolRegistry = new ToolRegistry({ auditStore: sessionStore });
+    const toolRegistry = new ToolRegistry({
+      auditStore: sessionStore,
+      approvalBroker,
+      identity: { authenticated: options.authenticated ?? false },
+    });
     toolRegistry.registerMany(createBuiltinTools(skillRegistry, sessionStore));
 
     const persistedContext = await sessionStore.loadContext(session.id);
@@ -95,6 +110,7 @@ export async function createChatRuntime(
       skillPromptBuilder,
     });
 
+    const broker = approvalBroker;
     let closed = false;
     return {
       agent,
@@ -103,14 +119,23 @@ export async function createChatRuntime(
       sessionStore,
       skillRegistry,
       toolRegistry,
-      close: () => {
+      approvalBroker: broker,
+      close: async () => {
         if (closed) return;
         closed = true;
-        sessionStore.close();
+        try {
+          await broker.close();
+        } finally {
+          sessionStore.close();
+        }
       },
     };
   } catch (error) {
-    sessionStore.close();
+    try {
+      if (approvalBroker) await approvalBroker.close();
+    } finally {
+      sessionStore.close();
+    }
     throw error;
   }
 }
