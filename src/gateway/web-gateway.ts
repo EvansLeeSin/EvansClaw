@@ -8,6 +8,11 @@ import {
 import path from "node:path";
 import type { ChatService } from "../chat/chat-service.js";
 import type {
+  ApprovalActor,
+  ApprovalBroker,
+  ApprovalRequest,
+} from "../tools/approval-broker.js";
+import type {
   SessionRecord,
   SessionStore,
 } from "../session/session-store.js";
@@ -22,6 +27,8 @@ export interface WebGatewayOptions {
   chat: Pick<ChatService, "send" | "reset">;
   sessionStore: Pick<SessionStore, "getOrCreate" | "load">;
   session: SessionRecord;
+  /** 运行时共享的审批 Broker；缺少时审批 API 以 503 fail-closed。 */
+  approvalBroker?: ApprovalBroker;
   host?: string;
   port?: number;
   corsOrigin?: string;
@@ -43,6 +50,18 @@ export interface WebGatewayAddress {
 
 type JsonObject = Record<string, unknown>;
 
+type ApprovalView = {
+  approvalId: string;
+  toolName: string;
+  toolLabel: string;
+  toolset: string;
+  risk: ApprovalRequest["risk"];
+  confirmationLevel: ApprovalRequest["confirmationLevel"];
+  displayArguments: string;
+  requestedAt: number;
+  expiresAt: number;
+};
+
 /**
  * Local-first HTTP boundary for a web UI. It deliberately exposes one
  * configured session and uses SSE for POSTed chat turns; multi-user routing,
@@ -52,6 +71,7 @@ export class WebGateway {
   private readonly chat: Pick<ChatService, "send" | "reset">;
   private readonly sessionStore: Pick<SessionStore, "getOrCreate" | "load">;
   private readonly session: SessionRecord;
+  private readonly approvalBroker: ApprovalBroker | undefined;
   private readonly host: string;
   private readonly port: number;
   private readonly corsOrigin: string;
@@ -66,6 +86,7 @@ export class WebGateway {
     this.chat = options.chat;
     this.sessionStore = options.sessionStore;
     this.session = options.session;
+    this.approvalBroker = options.approvalBroker;
     this.host = options.host ?? DEFAULT_HOST;
     this.port = positivePort(options.port ?? DEFAULT_PORT);
     this.corsOrigin = options.corsOrigin ?? DEFAULT_CORS_ORIGIN;
@@ -171,6 +192,21 @@ export class WebGateway {
         ok: true,
         service: "evansclaw",
       });
+      return;
+    }
+
+    if (request.method === "GET" && isSamePath(segments, ["api", "approvals"])) {
+      await this.handleApprovalList(response);
+      return;
+    }
+
+    if (
+      request.method === "POST" &&
+      segments.length === 3 &&
+      segments[0] === "api" &&
+      segments[1] === "approvals"
+    ) {
+      await this.handleApprovalResolution(request, response, segments[2]);
       return;
     }
 
@@ -283,6 +319,73 @@ export class WebGateway {
     response.end(headOnly ? undefined : body);
   }
 
+  private async handleApprovalList(response: ServerResponse): Promise<void> {
+    const broker = this.approvalBroker;
+    if (!broker) {
+      this.sendJson(response, 503, {
+        error: "approval_unavailable",
+        message: "审批服务当前不可用。",
+      });
+      return;
+    }
+
+    const actor = this.currentApprovalActor();
+    const approvals = broker
+      .listPending()
+      .filter((request) => sameApprovalActor(request.context, actor))
+      .map(toApprovalView);
+    this.sendJson(response, 200, { approvals });
+  }
+
+  private async handleApprovalResolution(
+    request: IncomingMessage,
+    response: ServerResponse,
+    approvalId: string,
+  ): Promise<void> {
+    const broker = this.approvalBroker;
+    if (!broker) {
+      this.sendJson(response, 503, {
+        error: "approval_unavailable",
+        message: "审批服务当前不可用。",
+      });
+      return;
+    }
+
+    const pending = broker.get(approvalId);
+    const actor = this.currentApprovalActor();
+    if (!pending || !sameApprovalActor(pending.context, actor)) {
+      this.sendNotFound(response);
+      return;
+    }
+
+    const body = await readJson(request, this.maxBodyBytes);
+    const decision = readApprovalDecision(body);
+    if (!decision) {
+      throw new HttpRequestError(
+        400,
+        "审批请求体必须包含 decision: approve 或 deny。",
+      );
+    }
+
+    const resolved = await broker.resolve({
+      approvalId,
+      decision,
+      // 绑定字段和操作者全部来自服务端 pending 请求，不接受浏览器篡改。
+      toolName: pending.toolName,
+      argsHash: pending.argsHash,
+      actor,
+    });
+    if (!resolved) {
+      this.sendJson(response, 409, {
+        error: "approval_not_pending",
+        message: "审批已被解决、取消或过期。",
+      });
+      return;
+    }
+
+    this.sendJson(response, 200, { ok: true, approvalId });
+  }
+
   private async handleMessage(
     request: IncomingMessage,
     response: ServerResponse,
@@ -305,17 +408,30 @@ export class WebGateway {
     });
 
     let disconnected = false;
+    const activeApprovalIds = new Set<string>();
     response.on("close", () => {
       disconnected = true;
+      void this.cancelApprovals(activeApprovalIds);
     });
 
     try {
       await this.enqueue(async () => {
-        await this.chat.send(text, (delta) => {
-          if (!disconnected && !response.writableEnded) {
-            writeSse(response, "delta", { text: delta });
-          }
-        });
+        const unsubscribe = this.subscribeApprovalEvents(
+          response,
+          activeApprovalIds,
+          () => disconnected || response.writableEnded,
+        );
+        try {
+          await this.chat.send(text, (delta) => {
+            if (!disconnected && !response.writableEnded) {
+              writeSse(response, "delta", { text: delta });
+            }
+          });
+        } finally {
+          unsubscribe();
+          // 如果 ChatService 在审批过程中异常退出，不能把请求遗留成可批准状态。
+          await this.cancelApprovals(activeApprovalIds);
+        }
       });
       if (!disconnected && !response.writableEnded) {
         writeSse(response, "done", { sessionId: this.session.id });
@@ -332,6 +448,47 @@ export class WebGateway {
     }
   }
 
+  private subscribeApprovalEvents(
+    response: ServerResponse,
+    activeApprovalIds: Set<string>,
+    isDisconnected: () => boolean,
+  ): () => void {
+    const broker = this.approvalBroker;
+    if (!broker) return () => undefined;
+
+    const actor = this.currentApprovalActor();
+    return broker.subscribe((event) => {
+      if (event.type === "requested") {
+        if (!sameApprovalActor(event.request.context, actor)) return;
+        activeApprovalIds.add(event.request.approvalId);
+        if (!isDisconnected()) {
+          writeSse(response, "approval_required", toApprovalView(event.request));
+        }
+        return;
+      }
+
+      if (!sameApprovalActor(event.result.request.context, actor)) return;
+      activeApprovalIds.delete(event.result.approvalId);
+      if (!isDisconnected()) {
+        writeSse(response, "approval_resolved", {
+          approvalId: event.result.approvalId,
+          outcome: event.result.outcome,
+          resolvedAt: event.result.resolvedAt,
+        });
+      }
+    });
+  }
+
+  private async cancelApprovals(activeApprovalIds: Set<string>): Promise<void> {
+    const broker = this.approvalBroker;
+    if (!broker || activeApprovalIds.size === 0) return;
+    const approvalIds = [...activeApprovalIds];
+    activeApprovalIds.clear();
+    await Promise.all(
+      approvalIds.map((approvalId) => broker.cancel(approvalId).catch(() => false)),
+    );
+  }
+
   private async handleReset(response: ServerResponse): Promise<void> {
     await this.enqueue(() => this.chat.reset());
     this.sendJson(response, 200, { ok: true, sessionId: this.session.id });
@@ -339,6 +496,15 @@ export class WebGateway {
 
   private async refreshSession(): Promise<SessionRecord> {
     return this.sessionStore.getOrCreate(this.session.id);
+  }
+
+  private currentApprovalActor(): ApprovalActor {
+    return {
+      sessionId: this.session.id,
+      conversationId: this.session.conversationId,
+      channel: this.session.channel,
+      userId: this.session.userId,
+    };
   }
 
   private isCurrentSession(sessionId: string): boolean {
@@ -383,6 +549,41 @@ export class WebGateway {
       message: "请求资源不存在。",
     });
   }
+}
+
+function toApprovalView(request: ApprovalRequest): ApprovalView {
+  return {
+    approvalId: request.approvalId,
+    toolName: request.toolName,
+    toolLabel: request.toolLabel,
+    toolset: request.toolset,
+    risk: request.risk,
+    confirmationLevel: request.confirmationLevel,
+    displayArguments: request.displayArguments,
+    requestedAt: request.requestedAt,
+    expiresAt: request.expiresAt,
+  };
+}
+
+function sameApprovalActor(
+  left: ApprovalActor,
+  right: ApprovalActor,
+): boolean {
+  return (
+    left.sessionId === right.sessionId &&
+    left.conversationId === right.conversationId &&
+    left.channel === right.channel &&
+    left.userId === right.userId
+  );
+}
+
+function readApprovalDecision(
+  body: unknown,
+): "approve" | "deny" | null {
+  if (!isJsonObject(body)) return null;
+  return body.decision === "approve" || body.decision === "deny"
+    ? body.decision
+    : null;
 }
 
 function positivePort(value: number): number {

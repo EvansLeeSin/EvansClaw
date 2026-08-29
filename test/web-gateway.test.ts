@@ -8,6 +8,7 @@ import {
   InMemorySessionStore,
   type SessionRecord,
 } from "../src/session/session-store.js";
+import { InMemoryApprovalBroker } from "../src/tools/approval-broker.js";
 import { WebGateway } from "../src/gateway/web-gateway.js";
 
 async function createFixture(options?: { staticDir?: string }) {
@@ -55,6 +56,66 @@ async function createFixture(options?: { staticDir?: string }) {
     },
     get resetCount() {
       return resetCount;
+    },
+  };
+}
+
+async function createApprovalFixture() {
+  const sessionStore = new InMemorySessionStore();
+  const session = await sessionStore.getOrCreate("web-approval-session", {
+    conversationId: "web-approval-conversation",
+    channel: "web",
+    userId: "local",
+  });
+  let approvalNumber = 0;
+  let lastOutcome: string | undefined;
+  const broker = new InMemoryApprovalBroker({
+    createId: () => `web-approval-${++approvalNumber}`,
+  });
+  const chat = {
+    async send(_text: string, onTextDelta: (delta: string) => void) {
+      const requestNumber = approvalNumber + 1;
+      const result = await broker.request({
+        requestId: `web-request-${requestNumber}`,
+        toolCallId: `web-tool-call-${requestNumber}`,
+        toolName: "write_test",
+        toolLabel: "写入测试",
+        toolset: "core",
+        risk: "write",
+        confirmationLevel: "standard",
+        argsHash: "web-args-hash",
+        displayArguments: '{"token":"[已隐藏]"}',
+        context: {
+          sessionId: session.id,
+          conversationId: session.conversationId,
+          channel: session.channel,
+          userId: session.userId,
+        },
+        expiresInMs: 5_000,
+      });
+      lastOutcome = result.outcome;
+      if (result.outcome === "approved") onTextDelta("工具已执行");
+      else onTextDelta(`审批结果：${result.outcome}`);
+    },
+    async reset() {},
+  };
+  const gateway = new WebGateway({
+    chat,
+    sessionStore,
+    session: session as SessionRecord,
+    approvalBroker: broker,
+    host: "127.0.0.1",
+    port: 0,
+  });
+  const address = await gateway.listen();
+
+  return {
+    address,
+    broker,
+    gateway,
+    session,
+    get lastOutcome() {
+      return lastOutcome;
     },
   };
 }
@@ -149,6 +210,171 @@ test("Web Gateway 校验请求、支持 CORS 和重置，并串行化同一会�
     assert.deepEqual(fixture.sent.slice(-2).sort(), ["one", "two"]);
   } finally {
     await fixture.gateway.close();
+  }
+});
+
+test("Web Gateway 通过 SSE 和服务端绑定 API 协调审批", async () => {
+  const fixture = await createApprovalFixture();
+  try {
+    const streamResponse = await fetch(
+      `${fixture.address.url}/api/sessions/${fixture.session.id}/messages`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: "执行写入" }),
+      },
+    );
+    assert.equal(streamResponse.status, 200);
+
+    const pending = await waitForPending(fixture.address.url, 1);
+    assert.equal(pending.length, 1);
+    const approval = pending[0];
+    assert.ok(approval);
+    assert.equal("argsHash" in approval, false);
+
+    const forged = await fetch(
+      `${fixture.address.url}/api/approvals/${approval.approvalId}`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          decision: "approve",
+          toolName: "forged_tool",
+          argsHash: "forged_hash",
+        }),
+      },
+    );
+    assert.equal(forged.status, 200);
+
+    const stream = await streamResponse.text();
+    const requestedIndex = stream.indexOf("event: approval_required");
+    const resolvedIndex = stream.indexOf("event: approval_resolved");
+    assert.ok(requestedIndex >= 0);
+    assert.ok(resolvedIndex > requestedIndex);
+    assert.match(stream, /event: delta/);
+    assert.match(stream, /工具已执行/);
+    assert.match(stream, /event: done/);
+    assert.doesNotMatch(stream, /web-args-hash/);
+    assert.equal(fixture.lastOutcome, "approved");
+
+    const after = await fetch(`${fixture.address.url}/api/approvals`);
+    assert.equal(after.status, 200);
+    assert.deepEqual(await after.json(), { approvals: [] });
+
+    // 已不再是 pending 的审批不会被重复解决。
+    const repeated = await fetch(
+      `${fixture.address.url}/api/approvals/${approval.approvalId}`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ decision: "deny" }),
+      },
+    );
+    assert.equal(repeated.status, 404);
+  } finally {
+    await fixture.gateway.close();
+    await fixture.broker.close();
+  }
+});
+
+test("Web Gateway 只展示当前会话审批，并在断线时取消审批", async () => {
+  const fixture = await createApprovalFixture();
+  try {
+    const foreign = fixture.broker.request({
+      requestId: "foreign-request",
+      toolCallId: "foreign-tool-call",
+      toolName: "write_test",
+      toolLabel: "写入测试",
+      toolset: "core",
+      risk: "write",
+      confirmationLevel: "standard",
+      argsHash: "foreign-hash",
+      displayArguments: "{}",
+      context: {
+        sessionId: "foreign-session",
+        conversationId: "foreign-conversation",
+        channel: "web",
+        userId: "foreign-user",
+      },
+      expiresInMs: 5_000,
+    });
+    const foreignRequest = fixture.broker.listPending().find(
+      (request) => request.context.sessionId === "foreign-session",
+    );
+    assert.ok(foreignRequest);
+
+    const pending = await fetch(`${fixture.address.url}/api/approvals`);
+    assert.equal(pending.status, 200);
+    assert.deepEqual(await pending.json(), { approvals: [] });
+
+    const hidden = await fetch(
+      `${fixture.address.url}/api/approvals/${foreignRequest.approvalId}`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ decision: "approve" }),
+      },
+    );
+    assert.equal(hidden.status, 404);
+    await fixture.broker.cancel(foreignRequest.approvalId);
+    assert.equal((await foreign).outcome, "cancelled");
+
+    const disconnected = await destroyAfterApprovalRequest(
+      fixture.address,
+      `/api/sessions/${fixture.session.id}/messages`,
+    );
+    assert.match(disconnected, /event: approval_required/);
+    await waitFor(
+      () => fixture.lastOutcome,
+      (outcome) => outcome === "cancelled",
+    );
+  } finally {
+    await fixture.gateway.close();
+    await fixture.broker.close();
+  }
+});
+
+test("Web Gateway 拒绝无效审批决策且保留 pending", async () => {
+  const fixture = await createApprovalFixture();
+  try {
+    const streamResponse = await fetch(
+      `${fixture.address.url}/api/sessions/${fixture.session.id}/messages`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: "等待审批" }),
+      },
+    );
+    const pending = await waitForPending(fixture.address.url, 1);
+    const approval = pending[0];
+    assert.ok(approval);
+
+    const invalid = await fetch(
+      `${fixture.address.url}/api/approvals/${approval.approvalId}`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ decision: "maybe" }),
+      },
+    );
+    assert.equal(invalid.status, 400);
+    assert.equal((await waitForPending(fixture.address.url, 1))[0]?.approvalId, approval.approvalId);
+
+    const denied = await fetch(
+      `${fixture.address.url}/api/approvals/${approval.approvalId}`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ decision: "deny" }),
+      },
+    );
+    assert.equal(denied.status, 200);
+    const stream = await streamResponse.text();
+    assert.match(stream, /审批结果：denied/);
+    assert.equal(fixture.lastOutcome, "denied");
+  } finally {
+    await fixture.gateway.close();
+    await fixture.broker.close();
   }
 });
 
@@ -248,6 +474,89 @@ test("Web Gateway 静态托管阻止路径穿越", async () => {
     await rm(secretPath, { force: true });
   }
 });
+
+type ApprovalView = {
+  approvalId: string;
+  toolName: string;
+  toolLabel: string;
+  toolset: string;
+  risk: string;
+  confirmationLevel: string;
+  displayArguments: string;
+  requestedAt: number;
+  expiresAt: number;
+};
+
+async function waitForPending(
+  baseUrl: string,
+  expectedCount: number,
+): Promise<ApprovalView[]> {
+  return waitFor(
+    async () => {
+      const response = await fetch(`${baseUrl}/api/approvals`);
+      assert.equal(response.status, 200);
+      const payload = (await response.json()) as { approvals: ApprovalView[] };
+      return payload.approvals;
+    },
+    (approvals) => approvals.length === expectedCount,
+  );
+}
+
+async function waitFor<T>(
+  read: () => T | Promise<T>,
+  predicate: (value: T) => boolean,
+  timeoutMs = 1_000,
+): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  let value = await read();
+  while (!predicate(value)) {
+    if (Date.now() >= deadline) throw new Error("等待测试状态超时。");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    value = await read();
+  }
+  return value;
+}
+
+function destroyAfterApprovalRequest(
+  address: { host: string; port: number },
+  requestPath: string,
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let body = "";
+    let closed = false;
+    const request = http.request(
+      {
+        host: address.host,
+        port: address.port,
+        path: requestPath,
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "content-length": Buffer.byteLength('{"text":"断开"}'),
+        },
+      },
+      (response) => {
+        response.setEncoding("utf8");
+        response.on("data", (chunk) => {
+          body += chunk;
+          if (body.includes("event: approval_required")) response.destroy();
+        });
+        response.on("close", () => {
+          closed = true;
+          resolve(body);
+        });
+        response.on("error", (error) => {
+          if (!closed) reject(error);
+        });
+      },
+    );
+    request.on("error", (error) => {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (!closed && code !== "ECONNRESET") reject(error);
+    });
+    request.end('{"text":"断开"}');
+  });
+}
 
 /** 发送未归一化的原始路径（fetch 会吞掉 ../，这里绕过客户端归一化）。 */
 function rawGet(
