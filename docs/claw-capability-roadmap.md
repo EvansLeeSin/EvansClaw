@@ -21,7 +21,7 @@
 - 使用 migration 表、事务、WAL 和 SQLite 写锁重试
 - 数据库固定保存于项目根目录：`data/evansclaw.sqlite`
 - 当前没有 Telegram、飞书等外部消息平台和定时任务；已增加仅监听本机的轻量 Web Gateway
-- Web Gateway 提供单一 Web 会话、HTTP JSON API 和 POST + SSE 流式回复
+- Web Gateway 提供单一 Web 会话、HTTP JSON API、审批 API 和 POST + SSE 流式回复
 - CLI 使用会话 ID `personal`，Web 默认使用 `web:local:personal`，避免两个进程共享同一个 Agent 内存状态
 
 模块一“SQLite 会话 + 全文搜索”已完成基础实现和测试。当前还没有 CLI `/search` 命令，搜索能力通过 `SessionStore.search()` API 提供。
@@ -73,7 +73,7 @@ CLI / Telegram / 飞书 / Web / Cron
 | 2 | Context 压缩 | 会话结构化存储、模型调用 | 高 | 已完成基础实现 |
 | 3 | Skills 按需加载 | Prompt 构造、文件读取 | 中 | 已完成基础实现 |
 | 4 | Tool Registry | Agent Tool API、TypeBox、SessionStore | 高 | 已完成基础实现 |
-| 5 | Tool Policy 和人工确认 | Tool Registry、身份上下文 | 高 | 待实现 |
+| 5 | Tool Policy 和人工确认 | Tool Registry、身份上下文 | 高 | Policy、Broker、Web 审批已完成，真实副作用工具待接入 |
 | 6 | Channel Gateway | AgentManager、Policy | 高 | Web 基础 Gateway 已完成，外部渠道待实现 |
 | 7 | Cron 定时任务 | Gateway、会话/任务存储 | 中 | 待实现 |
 | 8 | 长期记忆和用户画像 | SQLite、检索、Policy | 中 | 待实现 |
@@ -364,7 +364,7 @@ metadata:
 
 ### 状态：基础实现已完成
 
-模块四把此前直接挂在 SkillRegistry 上的 `load_skill` 桥接工具迁移到统一的工具边界，并先提供三个无副作用工具。它只负责“工具是什么、如何校验和执行”，不负责决定“当前调用是否有权限”；`allow / deny / ask` 和人工确认留给模块五。
+模块四把此前直接挂在 SkillRegistry 上的 `load_skill` 桥接工具迁移到统一的工具边界，并先提供三个无副作用工具。工具的定义、校验和执行由 Registry 负责；调用授权由模块五的 Policy 与 Approval Broker 在执行前统一闸门控制。
 
 ### 实际接口
 
@@ -423,7 +423,9 @@ AgentTool.execute
   → TypeBox/Pi 参数校验和必要的 JSON 类型转换
   → 创建调用级 AbortController
   → 应用父级取消和超时
-  → 写入 started 审计
+  → Policy allow / deny / ask
+  → 必要时等待 Approval Broker
+  → 获准后写入 started 审计
   → 执行工具实现
   → 截断过大的最终文本结果
   → 写入 succeeded / failed 审计
@@ -450,7 +452,7 @@ result_metadata_json, started_at, finished_at
 - Registry 直接适配 Pi `AgentTool`，不重新实现 Agent Loop。
 - Agent 全局工具执行默认是 `sequential`；定义仍可表达 `parallel`，但在只读并行策略明确前不开放副作用工具。
 - 当前没有 MCP、远程插件发现、文件/Shell/消息等副作用工具。
-- 当前没有 `allow / deny / ask` 策略，也没有人工确认；`risk` 只是审计和未来 Policy 的输入。
+- `allow / deny / ask` 策略、人工确认和审批持久化由模块五提供；Registry 通过授权闸门调用它们。
 - 工具调用超时、取消或异常会结束本次调用并留下失败审计，不会让主进程崩溃。
 - 工具输出有大小上限，避免一次调用直接膨胀上下文。
 
@@ -462,11 +464,15 @@ result_metadata_json, started_at, finished_at
 - [x] 工具超时、取消和异常不会让主进程崩溃。
 - [x] 每次开始并完成的调用都有 request、user、conversation 和结果状态审计。
 - [x] `load_skill` 已从模块三的临时桥接实现迁移到 Registry。
-- [x] `npm run typecheck` 通过，`npm test` 通过（38 个测试）。
+- [x] `npm run typecheck` 通过，`npm test` 通过（当前测试由模块五继续扩展）。
 
 ---
 
 ## 8. 模块五：Tool Policy 和人工确认
+
+### 状态：基础实现已完成
+
+D1–D8 已完成：Policy、Approval Broker、SQLite 审批持久化、ToolRegistry 授权闸门、Runtime 装配、Web 审批 API/SSE 和 React 审批卡片均已接通。当前仍没有真实的写入、外部通信或破坏性工具；这些工具接入时必须继续声明风险并经过同一闸门。
 
 ### 目标
 
@@ -494,6 +500,15 @@ result_metadata_json, started_at, finished_at
   → 记录审计结果
 ```
 
+### 实际实现
+
+- `src/tools/tool-policy.ts`：纯函数式 `allow / deny / ask` 决策；完整上下文中的 `read` 默认允许，可信身份的 `write/external` 需要标准确认，`destructive` 默认拒绝，缺少上下文或非法元数据时 fail closed。
+- `src/tools/approval-broker.ts`：一次性审批等待、绑定校验、超时、取消、事件和并发终态仲裁；持久化模式下先落 pending，再发布事件，终态落库失败绝不返回 approved。
+- `src/tools/approval-store.ts`：内存和 SQLite 审批存储；审批表只保存 `argsHash` 与脱敏展示参数，重启时旧 owner 的 pending 请求标记为 expired。
+- `src/tools/tool-registry.ts`：参数校验后进入 Policy；`ask` 没有 Broker 时 fail closed，批准后再次检查 Policy，只有真正获准才开始工具审计和执行。
+- `src/gateway/web-gateway.ts`：提供当前 Web 会话的审批列表/解决 API，以及 `approval_required` / `approval_resolved` SSE 事件；浏览器断线会取消本轮 pending 审批。
+- `web/src/components/chat/approval-card.tsx`：只渲染脱敏参数，提供一次性允许/拒绝按钮；前端不提交绑定字段，也不自行判断过期。
+
 ### 关键设计
 
 - 默认拒绝未知工具。
@@ -503,14 +518,23 @@ result_metadata_json, started_at, finished_at
 - 确认有超时，超时默认拒绝。
 - Cron 等无人值守场景不能默认继承人工确认。
 - 策略判断不能由模型输出决定。
+- 审批请求和工具执行审计分开保存；未获准的调用不伪造 `tool_calls` 执行记录。
 
-### 验收标准
+### 验收结果
 
-- 读操作可以按策略自动执行。
-- 写、发送、删除操作会正确触发确认。
-- 用户拒绝后 Agent 不会重复绕过策略执行。
-- 无用户身份或权限配置时，敏感工具默认拒绝。
-- 审计日志可以还原一次工具执行。
+- [x] 读操作可以按策略自动执行。
+- [x] 写、发送、删除类工具在可信身份下会触发确认，破坏性工具默认拒绝。
+- [x] 用户拒绝、超时、取消后 Agent 不会绕过策略执行。
+- [x] 无用户身份、Broker 或完整上下文时，敏感工具默认拒绝。
+- [x] 审批只绑定当前工具、参数指纹、身份和会话，策略变化会阻止旧批准继续执行。
+- [x] 审批生命周期和工具执行审计均可查询；原始审批参数不落审批表。
+- [x] Web UI 可以展示脱敏审批、批准/拒绝并接收 SSE 状态更新。
+- [x] `npm run typecheck`、`npm test`、`npm run build:ui` 和浏览器冒烟测试通过。
+
+### 当前限制
+
+- 尚未接入真实的文件写入、Shell、消息发送或外部 API 工具。
+- Web Gateway 仍是本机单会话、无认证入口，只适合本机或受信任开发环境。
 
 ---
 
@@ -526,7 +550,9 @@ result_metadata_json, started_at, finished_at
 - `GET /api/health`；
 - `GET /api/sessions`；
 - `GET /api/sessions/:id/messages`；
-- `POST /api/sessions/:id/messages`：JSON 请求，SSE 流式返回 `delta`、`done` 或 `error` 事件；
+- `POST /api/sessions/:id/messages`：JSON 请求，SSE 流式返回 `delta`、`done`、`error`、`approval_required` 或 `approval_resolved` 事件；
+- `GET /api/approvals`：查询当前会话的脱敏 pending 审批；
+- `POST /api/approvals/:approvalId`：只提交 `approve`/`deny` 决策，绑定字段由服务端恢复；
 - `POST /api/sessions/:id/reset`；
 - CORS、请求体大小限制、输入校验和同一会话串行队列；
 - 同源静态托管：非 `/api` 的 GET/HEAD 请求从 `web/dist` 返回，支持 MIME、Vite `assets/` 长缓存、SPA `index.html` 回退和路径穿越防护。
@@ -545,16 +571,17 @@ npm run web
 
 技术选型：Vite + React 19 + TypeScript + Tailwind CSS v4 + shadcn/ui（Base UI 版聊天组件：`MessageScroller`/`Message`/`Bubble`/`Marker`），Markdown 渲染用 react-markdown + rehype-highlight。
 
-- `web/src/lib/api.ts`：Gateway 客户端（REST + 手动解析 POST SSE 流，复刻 `delta`/`done`/`error` 事件）；
+- `web/src/lib/api.ts`：Gateway 客户端（REST + 手动解析 POST SSE 流，支持 `delta`/`done`/`error`/`approval_*` 事件）；
 - `web/src/lib/types.ts`：与后端 `AgentMessage` JSON 对齐的只读渲染类型；
 - `web/src/components/chat/`：聊天主界面与消息渲染——
   - user 消息：右对齐气泡；
   - assistant 消息：thinking 折叠块、Markdown 正文、工具调用卡片（按 `toolCallId` 把 `toolResult` 合并进对应 `toolCall` 展示）；
   - 流式回复：发送时乐观插入用户消息，SSE 增量渲染，`done` 后重新拉取全量消息以对齐 SQLite 事实；
   - 会话重置（两段式确认）、连接/对话错误横幅与重试；失败轮次 refetch 时保留错误提示；
+  - 审批卡片：展示风险、确认级别和脱敏参数，支持一次性允许/拒绝，终态由 SSE 与服务端重同步共同确认；
 - `web/vite.config.ts`：开发期 `/api` 代理到 `127.0.0.1:8787`，无需 CORS；
-- `web/mock/gateway.mjs`：无需 DeepSeek API Key 的 mock Gateway（覆盖全部渲染分支的预置历史 + SSE 流式回复）；
-- `web/mock/smoke.mjs`：puppeteer-core 驱动本机 Edge 的无头冒烟测试。
+- `web/mock/gateway.mjs`：无需 DeepSeek API Key 的 mock Gateway（覆盖全部渲染分支、审批 API 和 SSE 流式回复）；
+- `web/mock/smoke.mjs`：puppeteer-core 驱动本机 Edge 的无头冒烟测试，覆盖批准/拒绝和参数脱敏。
 
 运行、开发与验证：
 

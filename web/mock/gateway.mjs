@@ -17,6 +17,8 @@ const SESSION_ID = "web:local:personal";
 
 const now = Date.now();
 let clock = now;
+let approvalCounter = 0;
+const approvals = new Map();
 
 function ts() {
   clock += 1000;
@@ -117,6 +119,14 @@ const server = createServer((request, response) => {
     segments[0] === "api" &&
     segments[1] === "sessions" &&
     segments[3] === "reset";
+  const isApprovalsRoute =
+    segments.length === 2 &&
+    segments[0] === "api" &&
+    segments[1] === "approvals";
+  const isApprovalResolutionRoute =
+    segments.length === 3 &&
+    segments[0] === "api" &&
+    segments[1] === "approvals";
   response.setHeader("Access-Control-Allow-Origin", "*");
   response.setHeader("Access-Control-Allow-Headers", "Content-Type");
   response.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -142,8 +152,72 @@ const server = createServer((request, response) => {
     return sendJson(200, { sessions: [sessionRecord()] });
   }
 
+  if (request.method === "GET" && isApprovalsRoute) {
+    return sendJson(200, {
+      approvals: [...approvals.values()].map(({ approval }) => approval),
+    });
+  }
+
   if (request.method === "GET" && isMessagesRoute) {
     return sendJson(200, { session: sessionRecord(), messages: history });
+  }
+
+  if (request.method === "POST" && isApprovalResolutionRoute) {
+    let body = "";
+    request.on("data", (chunk) => (body += chunk));
+    request.on("end", () => {
+      let decision;
+      try {
+        decision = JSON.parse(body || "{}").decision;
+      } catch {
+        return sendJson(400, {
+          error: "invalid_request",
+          message: "审批请求体格式无效。",
+        });
+      }
+      if (decision !== "approve" && decision !== "deny") {
+        return sendJson(400, {
+          error: "invalid_request",
+          message: "审批决策无效。",
+        });
+      }
+      const pending = approvals.get(segments[2]);
+      if (!pending) {
+        return sendJson(404, {
+          error: "not_found",
+          message: "审批请求不存在。",
+        });
+      }
+      approvals.delete(segments[2]);
+      const outcome = decision === "approve" ? "approved" : "denied";
+      pending.response.write(
+        `event: approval_resolved\ndata: ${JSON.stringify({
+          approvalId: pending.approval.approvalId,
+          outcome,
+          resolvedAt: Date.now(),
+        })}\n\n`,
+      );
+      const reply =
+        decision === "approve"
+          ? "审批已通过，工具操作完成。"
+          : "审批已拒绝，工具没有执行。";
+      history.push({
+        role: "assistant",
+        content: [{ type: "text", text: reply }],
+        model: "deepseek-v4-flash",
+        stopReason: "stop",
+        timestamp: ts(),
+      });
+      pending.response.write(
+        `event: delta\ndata: ${JSON.stringify({ text: reply })}\n\n`,
+      );
+      pending.response.write(
+        `event: done\ndata: ${JSON.stringify({ sessionId: SESSION_ID })}\n\n`,
+      );
+      pending.response.end();
+      sendJson(200, { ok: true, approvalId: pending.approval.approvalId });
+    });
+    return;
   }
 
   if (request.method === "POST" && isMessagesRoute) {
@@ -166,6 +240,32 @@ const server = createServer((request, response) => {
           })}\n\n`,
         );
         response.end();
+        return;
+      }
+
+      // 回归夹具：把一轮对话停在审批处，供浏览器测试点击批准。
+      if (text === "__mock_approval__") {
+        const approval = {
+          approvalId: `mock-approval-${++approvalCounter}`,
+          toolName: "write_test",
+          toolLabel: "写入测试工具",
+          toolset: "core",
+          risk: "write",
+          confirmationLevel: "standard",
+          displayArguments: '{"token":"[已隐藏]","note":"mock 写入"}',
+          requestedAt: Date.now(),
+          expiresAt: Date.now() + 60_000,
+        };
+        const pending = { approval, response };
+        approvals.set(approval.approvalId, pending);
+        response.on("close", () => {
+          if (approvals.get(approval.approvalId) === pending) {
+            approvals.delete(approval.approvalId);
+          }
+        });
+        response.write(
+          `event: approval_required\ndata: ${JSON.stringify(approval)}\n\n`,
+        );
         return;
       }
 
@@ -193,6 +293,10 @@ const server = createServer((request, response) => {
   }
 
   if (request.method === "POST" && isResetRoute) {
+    for (const { response: pendingResponse } of approvals.values()) {
+      pendingResponse.end();
+    }
+    approvals.clear();
     history.length = 0;
     clock = now;
     return sendJson(200, { ok: true, sessionId: SESSION_ID });

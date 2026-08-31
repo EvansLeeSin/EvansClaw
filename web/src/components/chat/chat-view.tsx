@@ -2,8 +2,8 @@
  * EvansClaw 聊天主界面。
  *
  * 数据流：挂载时从 Gateway 拉取当前会话与历史消息；
- * 发送时本地乐观插入用户消息，SSE 增量渲染助手回复；
- * 一轮结束后重新拉取全量消息——流里只有文本增量，
+ * 发送时本地乐观插入用户消息，SSE 增量渲染助手回复并接收审批事件；
+ * 一轮结束后重新拉取全量消息和 pending 审批——流里只有文本增量，
  * thinking / 工具调用 / 工具结果等结构化内容以持久化后的
  * 消息列表为准，这样 UI 永远和 SQLite 里的会话事实对齐。
  */
@@ -27,24 +27,40 @@ import {
   MessageScrollerViewport,
 } from "@/components/ui/message-scroller";
 import { AgentMessageItem } from "@/components/chat/agent-message";
+import {
+  ApprovalCard,
+  type ApprovalCardStatus,
+} from "@/components/chat/approval-card";
 import { Markdown } from "@/components/chat/markdown";
 import {
+  fetchApprovals,
   fetchMessages,
   fetchSession,
   GatewayError,
   resetSession,
+  resolveApproval,
   sendMessage,
 } from "@/lib/api";
+import type { ApprovalResolvedEvent } from "@/lib/api";
 import type {
   AgentMessage,
+  ApprovalRequestView,
   SessionRecord,
   ToolResultMessage,
   UserMessage,
 } from "@/lib/types";
 
+interface ApprovalCardState {
+  approval: ApprovalRequestView;
+  status: ApprovalCardStatus;
+  resolving: boolean;
+  error?: string;
+}
+
 export function ChatView() {
   const [session, setSession] = useState<SessionRecord | null>(null);
   const [messages, setMessages] = useState<AgentMessage[]>([]);
+  const [approvals, setApprovals] = useState<ApprovalCardState[]>([]);
   const [streamingText, setStreamingText] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -68,6 +84,14 @@ export function ChatView() {
         setSession(currentSession);
         const history = await fetchMessages(currentSession.id);
         setMessages(history);
+        const pendingApprovals = await fetchApprovals();
+        setApprovals(
+          pendingApprovals.map((approval) => ({
+            approval,
+            status: "pending" as const,
+            resolving: false,
+          })),
+        );
         if (!options?.preserveError) setLoadError(null);
       } catch (error) {
         setLoadError(
@@ -96,6 +120,84 @@ export function ChatView() {
     return map;
   }, [messages]);
 
+  const handleApprovalRequired = useCallback(
+    (approval: ApprovalRequestView): void => {
+      setApprovals((previous) => {
+        const existing = previous.findIndex(
+          (item) => item.approval.approvalId === approval.approvalId,
+        );
+        if (existing === -1) {
+          return [
+            ...previous,
+            { approval, status: "pending", resolving: false },
+          ];
+        }
+        return previous.map((item, index) =>
+          index === existing
+            ? { approval, status: "pending", resolving: false }
+            : item,
+        );
+      });
+    },
+    [],
+  );
+
+  const handleApprovalResolved = useCallback(
+    (event: ApprovalResolvedEvent): void => {
+      setApprovals((previous) =>
+        previous.map((item) =>
+          item.approval.approvalId === event.approvalId
+            ? { ...item, status: event.outcome, resolving: false, error: undefined }
+            : item,
+        ),
+      );
+    },
+    [],
+  );
+
+  const handleApprovalResolve = useCallback(
+    async (
+      approvalId: string,
+      decision: "approve" | "deny",
+    ): Promise<void> => {
+      setApprovals((previous) =>
+        previous.map((item) =>
+          item.approval.approvalId === approvalId
+            ? { ...item, resolving: true, error: undefined }
+            : item,
+        ),
+      );
+      try {
+        await resolveApproval(approvalId, decision);
+        // SSE 通常会随后提供准确终态；这里先解除 loading，避免断开流时
+        // 卡片永远显示处理中。若收到 SSE，事件状态会再次覆盖这里的值。
+        setApprovals((previous) =>
+          previous.map((item) =>
+            item.approval.approvalId === approvalId
+              ? {
+                  ...item,
+                  status: decision === "approve" ? "approved" : "denied",
+                  resolving: false,
+                  error: undefined,
+                }
+              : item,
+          ),
+        );
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        setApprovals((previous) =>
+          previous.map((item) =>
+            item.approval.approvalId === approvalId
+              ? { ...item, resolving: false, error: detail }
+              : item,
+          ),
+        );
+        setLoadError(`审批请求失败：${detail}`);
+      }
+    },
+    [],
+  );
+
   const handleSend = useCallback(async (): Promise<void> => {
     const text = input.trim();
     if (!text || sending || !session) return;
@@ -116,6 +218,8 @@ export function ChatView() {
     try {
       await sendMessage(session.id, text, {
         onDelta: (delta) => setStreamingText((prev) => (prev ?? "") + delta),
+        onApprovalRequired: handleApprovalRequired,
+        onApprovalResolved: handleApprovalResolved,
       });
     } catch (error) {
       requestFailed = true;
@@ -129,7 +233,14 @@ export function ChatView() {
       // 但同步成功不能把刚产生的发送错误立即清掉。
       await reload({ preserveError: requestFailed });
     }
-  }, [input, sending, session, reload]);
+  }, [
+    handleApprovalRequired,
+    handleApprovalResolved,
+    input,
+    reload,
+    sending,
+    session,
+  ]);
 
   const handleReset = useCallback(async (): Promise<void> => {
     if (!session || sending) return;
@@ -224,6 +335,22 @@ export function ChatView() {
                   />
                 </MessageScrollerItem>
               ))}
+              {approvals.map((item) => (
+                <MessageScrollerItem
+                  key={`approval-${item.approval.approvalId}`}
+                  scrollAnchor
+                >
+                  <ApprovalCard
+                    approval={item.approval}
+                    status={item.status}
+                    resolving={item.resolving}
+                    error={item.error}
+                    onResolve={(decision) =>
+                      void handleApprovalResolve(item.approval.approvalId, decision)
+                    }
+                  />
+                </MessageScrollerItem>
+              ))}
               {/* 流式中的助手回复：实时文本 + 状态指示 */}
               {streamingText !== null && (
                 <MessageScrollerItem scrollAnchor>
@@ -233,7 +360,9 @@ export function ChatView() {
               {sending && streamingText === null && (
                 <MessageScrollerItem scrollAnchor>
                   <p className="shimmer px-1 text-xs text-muted-foreground">
-                    正在生成回复…
+                    {approvals.some((item) => item.status === "pending")
+                      ? "等待审批确认…"
+                      : "正在生成回复…"}
                   </p>
                 </MessageScrollerItem>
               )}

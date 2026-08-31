@@ -96,6 +96,8 @@ GET  /api/health
 GET  /api/sessions
 GET  /api/sessions/:id/messages
 POST /api/sessions/:id/messages   # {"text":"..."}，SSE 流式响应
+GET  /api/approvals              # 当前会话的脱敏 pending 审批
+POST /api/approvals/:approvalId  # {"decision":"approve"|"deny"}
 POST /api/sessions/:id/reset
 ```
 
@@ -108,7 +110,7 @@ npm run dev:web     # 终端 1：Gateway（需 DEEPSEEK_API_KEY）
 npm run dev:ui      # 终端 2：Vite http://localhost:5173，/api 代理到 8787
 ```
 
-无 API Key 时可用 mock Gateway 联调：`cd web && npm run mock`，并用 `npm run smoke` 跑无头浏览器冒烟测试。
+无 API Key 时可用 mock Gateway 联调：`cd web && npm run mock`，并用 `npm run smoke` 跑无头浏览器冒烟测试。审批中的写入/外部操作会通过 SSE 推送审批卡片，浏览器只提交批准或拒绝决策。
 
 默认 Web 会话为 `web:local:personal`，与 CLI 的 `personal` 会话分开。可通过 `EVANSCLAW_WEB_HOST`、`EVANSCLAW_WEB_PORT`、`EVANSCLAW_WEB_CORS_ORIGIN` 和 `EVANSCLAW_WEB_SESSION_ID` 配置。`EVANSCLAW_WEB_STATIC_DIR` 可覆盖默认的 `web/dist` 静态目录；显式目录无效时启动会失败并给出错误。Gateway 默认只监听本机且没有认证，不应直接暴露到公网。
 
@@ -127,10 +129,11 @@ skills/<skill-name>/SKILL.md
 
 ## 后续设计方向
 
-1. 为写入、发送、删除类工具增加 Tool Policy 和人工确认
-2. 为每个外部聊天会话维护独立 Agent
-3. 增加 Telegram 或飞书 Channel Adapter
-4. 增加长期记忆、定时任务和事件触发
+1. 为每个外部聊天会话维护独立 Agent
+2. 增加 Telegram 或飞书 Channel Adapter
+3. 增加长期记忆、定时任务和事件触发
+
+Tool Policy、审批 Broker、审批持久化和 Web 审批交互已完成；当前仍只注册三个只读工具。
 
 会话数据库默认保存到：
 

@@ -4,14 +4,21 @@
  * 对接的 API 面（src/gateway/web-gateway.ts）：
  * - GET  /api/sessions                     → { sessions: SessionRecord[] }
  * - GET  /api/sessions/:id/messages        → { session, messages }
- * - POST /api/sessions/:id/messages        → SSE 流（delta / done / error 事件）
+ * - POST /api/sessions/:id/messages        → SSE 流（delta / done / error / approval_* 事件）
+ * - GET  /api/approvals                     → { approvals: ApprovalRequestView[] }
+ * - POST /api/approvals/:id                 → { ok, approvalId }
  * - POST /api/sessions/:id/reset           → { ok, sessionId }
  *
  * 开发环境下 Vite 把 /api 代理到 127.0.0.1:8787（见 vite.config.ts），
  * 生产环境前后端同源，因此这里不需要配置 API base，统一走相对路径。
  */
 
-import type { AgentMessage, SessionRecord } from "./types";
+import type {
+  AgentMessage,
+  ApprovalOutcome,
+  ApprovalRequestView,
+  SessionRecord,
+} from "./types";
 
 export class GatewayError extends Error {
   readonly status: number;
@@ -41,6 +48,27 @@ export async function fetchMessages(
   return data.messages;
 }
 
+/** 拉取当前会话仍在等待的审批请求。 */
+export async function fetchApprovals(): Promise<ApprovalRequestView[]> {
+  const data = await getJson<{ approvals: ApprovalRequestView[] }>(
+    "/api/approvals",
+  );
+  if (!Array.isArray(data.approvals) || !data.approvals.every(isApprovalRequestView)) {
+    throw new GatewayError(500, "Gateway 返回了无效的审批列表。");
+  }
+  return data.approvals;
+}
+
+/** 解决一次审批；绑定字段由 Gateway 从服务端 pending 请求恢复。 */
+export async function resolveApproval(
+  approvalId: string,
+  decision: "approve" | "deny",
+): Promise<void> {
+  await postJson(`/api/approvals/${encodeURIComponent(approvalId)}`, {
+    decision,
+  });
+}
+
 /** 重置会话（清空上下文，会话记录本身保留）。 */
 export async function resetSession(sessionId: string): Promise<void> {
   await postJson(`/api/sessions/${encodeURIComponent(sessionId)}/reset`, {});
@@ -49,6 +77,16 @@ export async function resetSession(sessionId: string): Promise<void> {
 export interface SendHandlers {
   /** 收到一段流式文本增量。 */
   onDelta: (text: string) => void;
+  /** 收到需要用户决定的安全审批请求。 */
+  onApprovalRequired?: (approval: ApprovalRequestView) => void;
+  /** 收到审批终态；真正的消息内容仍在本轮结束后重新拉取。 */
+  onApprovalResolved?: (event: ApprovalResolvedEvent) => void;
+}
+
+export interface ApprovalResolvedEvent {
+  approvalId: string;
+  outcome: ApprovalOutcome;
+  resolvedAt: number;
 }
 
 /**
@@ -111,11 +149,71 @@ function dispatchSseEvent(rawEvent: string, handlers: SendHandlers): void {
   if (eventName === "delta") {
     const payload = JSON.parse(data) as { text?: string };
     if (payload.text) handlers.onDelta(payload.text);
+  } else if (eventName === "approval_required") {
+    const payload = JSON.parse(data) as ApprovalRequestView;
+    if (!isApprovalRequestView(payload)) {
+      throw new GatewayError(500, "Gateway 返回了无效的审批请求。");
+    }
+    handlers.onApprovalRequired?.(payload);
+  } else if (eventName === "approval_resolved") {
+    const payload = JSON.parse(data) as Partial<ApprovalResolvedEvent>;
+    if (!isApprovalResolvedEvent(payload)) {
+      throw new GatewayError(500, "Gateway 返回了无效的审批结果。");
+    }
+    handlers.onApprovalResolved?.(payload);
   } else if (eventName === "error") {
     const payload = JSON.parse(data) as { message?: string };
     throw new GatewayError(500, payload.message ?? "对话请求失败。");
   }
   // done 事件无需处理：sendMessage 正常返回即代表一轮结束。
+}
+
+function isApprovalRequestView(value: unknown): value is ApprovalRequestView {
+  if (!value || typeof value !== "object") return false;
+  const approval = value as Partial<ApprovalRequestView>;
+  return (
+    typeof approval.approvalId === "string" &&
+    typeof approval.toolName === "string" &&
+    typeof approval.toolLabel === "string" &&
+    typeof approval.toolset === "string" &&
+    isApprovalRisk(approval.risk) &&
+    isApprovalConfirmationLevel(approval.confirmationLevel) &&
+    typeof approval.displayArguments === "string" &&
+    Number.isFinite(approval.requestedAt) &&
+    Number.isFinite(approval.expiresAt)
+  );
+}
+
+function isApprovalResolvedEvent(
+  value: Partial<ApprovalResolvedEvent>,
+): value is ApprovalResolvedEvent {
+  return (
+    typeof value.approvalId === "string" &&
+    isApprovalOutcome(value.outcome) &&
+    Number.isFinite(value.resolvedAt)
+  );
+}
+
+function isApprovalRisk(value: unknown): boolean {
+  return (
+    value === "read" ||
+    value === "write" ||
+    value === "external" ||
+    value === "destructive"
+  );
+}
+
+function isApprovalConfirmationLevel(value: unknown): boolean {
+  return value === "standard" || value === "strong";
+}
+
+function isApprovalOutcome(value: unknown): value is ApprovalOutcome {
+  return (
+    value === "approved" ||
+    value === "denied" ||
+    value === "expired" ||
+    value === "cancelled"
+  );
 }
 
 async function getJson<T>(url: string): Promise<T> {

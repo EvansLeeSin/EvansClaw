@@ -20,6 +20,27 @@ export interface SessionRecord {
   messageCount: number;
 }
 
+export type ApprovalRisk = "read" | "write" | "external" | "destructive";
+export type ApprovalConfirmationLevel = "standard" | "strong";
+export type ApprovalOutcome =
+  | "approved"
+  | "denied"
+  | "expired"
+  | "cancelled";
+
+/** Gateway 为审批 UI 提供的安全视图，不包含 argsHash、原始参数或身份。 */
+export interface ApprovalRequestView {
+  approvalId: string;
+  toolName: string;
+  toolLabel: string;
+  toolset: string;
+  risk: ApprovalRisk;
+  confirmationLevel: ApprovalConfirmationLevel;
+  displayArguments: string;
+  requestedAt: number;
+  expiresAt: number;
+}
+
 export interface TextContent {
   type: "text";
   text: string;

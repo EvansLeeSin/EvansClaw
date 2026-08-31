@@ -74,7 +74,36 @@ try {
   checks.push(["用户消息上屏", afterText.includes("你好，来一段流式回复")]);
   checks.push(["流式回复渲染", afterText.includes("这是 mock 网关的流式回复")]);
 
-  // 3) SSE error → refetch 已部分持久化消息，但错误横幅必须继续保留。
+  // 3) 审批事件 → 卡片展示脱敏参数 → 点击允许 → 继续完成本轮。
+  await page.type("textarea", "__mock_approval__");
+  await page.click('button[aria-label="发送"]');
+  await page.waitForSelector('[data-approval-status="pending"]', {
+    timeout: 15000,
+  });
+  const approvalText = await page.evaluate(() => document.body.innerText);
+  checks.push(["审批卡片展示", approvalText.includes("需要确认工具操作")]);
+  checks.push(["审批参数脱敏", approvalText.includes("[已隐藏]")]);
+  checks.push(["审批按钮可用", await page.$('button[aria-label="允许一次"]') !== null]);
+  await page.click('[data-approval-status="pending"] button[aria-label="允许一次"]');
+  await page.waitForFunction(
+    () => document.body.innerText.includes("审批已通过，工具操作完成"),
+    { timeout: 15000 },
+  );
+  checks.push(["批准后继续对话", (await page.evaluate(() => document.body.innerText)).includes("审批已通过，工具操作完成")]);
+
+  await page.type("textarea", "__mock_approval__");
+  await page.click('button[aria-label="发送"]');
+  await page.waitForSelector('[data-approval-status="pending"]', {
+    timeout: 15000,
+  });
+  await page.click('[data-approval-status="pending"] button[aria-label="拒绝审批"]');
+  await page.waitForFunction(
+    () => document.body.innerText.includes("审批已拒绝，工具没有执行"),
+    { timeout: 15000 },
+  );
+  checks.push(["拒绝后不执行工具", (await page.evaluate(() => document.body.innerText)).includes("审批已拒绝，工具没有执行")]);
+
+  // 5) SSE error → refetch 已部分持久化消息，但错误横幅必须继续保留。
   await page.type("textarea", "__mock_error__");
   await page.click('button[aria-label="发送"]');
   await page.waitForFunction(
