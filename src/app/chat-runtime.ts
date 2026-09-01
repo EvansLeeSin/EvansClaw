@@ -1,34 +1,13 @@
-import { resolve } from "node:path";
-import type { Agent } from "@earendil-works/pi-agent-core";
-import {
-  createAgent,
-  createContextSummarizer,
-} from "../agent/create-agent.js";
-import { ChatService } from "../chat/chat-service.js";
-import {
-  ContextManager,
-  restoreContextMessages,
-} from "../context/context-manager.js";
-import { config } from "../config.js";
-import {
-  SqliteSessionStore,
-  type SessionRecord,
-} from "../session/session-store.js";
-import { SkillPromptBuilder } from "../skills/skill-prompt.js";
-import { SkillRegistry } from "../skills/skill-registry.js";
-import { createBuiltinTools } from "../tools/builtin-tools.js";
-import { InMemoryApprovalBroker } from "../tools/approval-broker.js";
-import { createWriteFileTool } from "../tools/file-tools.js";
-import { ToolRegistry } from "../tools/tool-registry.js";
+import { createAgentManagerRuntime } from "./agent-manager-runtime.js";
+import type { AgentSessionHandle } from "../agent/agent-manager.js";
+import type { InMemoryApprovalBroker } from "../tools/approval-broker.js";
+import type { ToolRegistry } from "../tools/tool-registry.js";
+import type { SessionRecord } from "../session/session-store.js";
+import type { SqliteSessionStore } from "../session/session-store.js";
+import type { SkillRegistry } from "../skills/skill-registry.js";
 
-const projectRoot = resolve(import.meta.dirname, "../..");
-export const DEFAULT_WORKSPACE_ROOT = resolve(projectRoot, "data", "workspace");
-
-/** Resolves the operator-selected workspace without creating it. */
-export function resolveWorkspaceRoot(configured?: string): string {
-  const value = configured?.trim() || process.env.EVANSCLAW_WORKSPACE_DIR?.trim();
-  return value ? resolve(value) : DEFAULT_WORKSPACE_ROOT;
-}
+export { DEFAULT_WORKSPACE_ROOT } from "./agent-manager-runtime.js";
+export { resolveWorkspaceRoot } from "./agent-manager-runtime.js";
 
 export interface ChatRuntimeOptions {
   databasePath?: string;
@@ -45,12 +24,12 @@ export interface ChatRuntimeOptions {
 }
 
 /**
- * All transports share this assembly path so the CLI and Web Gateway use the
- * same Skill, Tool, Context, and persistence boundaries.
+ * Compatibility view for a single-session host. The chat property is a
+ * manager-controlled handle, so callers cannot bypass per-session ordering by
+ * invoking the underlying pi Agent directly.
  */
 export interface ChatRuntime {
-  readonly agent: Agent;
-  readonly chat: ChatService;
+  readonly chat: AgentSessionHandle;
   readonly session: SessionRecord;
   readonly sessionStore: SqliteSessionStore;
   readonly skillRegistry: SkillRegistry;
@@ -60,100 +39,44 @@ export interface ChatRuntime {
   close(): Promise<void>;
 }
 
+/**
+ * Build the legacy one-session view on top of the process-wide manager. New
+ * multi-channel hosts should create one AgentManagerRuntime and obtain several
+ * handles from its manager instead of calling this function repeatedly.
+ */
 export async function createChatRuntime(
   options: ChatRuntimeOptions,
 ): Promise<ChatRuntime> {
-  const sessionStore = new SqliteSessionStore(
-    options.databasePath ?? resolve(projectRoot, "data", "evansclaw.sqlite"),
-  );
-  const workspaceRoot = resolveWorkspaceRoot(options.workspaceRoot);
-  let approvalBroker: InMemoryApprovalBroker | undefined;
+  const shared = await createAgentManagerRuntime({
+    databasePath: options.databasePath,
+    workspaceRoot: options.workspaceRoot,
+  });
 
   try {
-    // 审批记录与会话、工具审计共用同一个 SQLite 生命周期；Broker 本身仍只
-    // 负责并发等待和事件，所有可恢复状态由 ApprovalStore 负责。
-    approvalBroker = new InMemoryApprovalBroker({
-      approvalStore: sessionStore,
-    });
-
-    const skillRegistry = new SkillRegistry([
-      {
-        path: resolve(projectRoot, "skills"),
-        source: "project",
-        priority: 10,
-      },
-      {
-        path: resolve(projectRoot, ".agents", "skills"),
-        source: "project-agent",
-        priority: 20,
-      },
-    ]);
-    await skillRegistry.refresh();
-
-    const skillPromptBuilder = new SkillPromptBuilder(
-      config.systemPrompt,
-      skillRegistry,
-    );
-    const session = await sessionStore.getOrCreate(options.sessionId, {
+    const handle = await shared.manager.getOrCreate({
+      sessionId: options.sessionId,
       conversationId: options.conversationId ?? options.sessionId,
       channel: options.channel,
       userId: options.userId,
-      model: config.model,
-    });
-    const toolRegistry = new ToolRegistry({
-      auditStore: sessionStore,
-      approvalBroker,
       identity: { authenticated: options.authenticated ?? false },
+      profile: options.enableWriteFileTool ? "web-workspace" : "read-only",
     });
-    toolRegistry.registerMany(createBuiltinTools(skillRegistry, sessionStore));
-    if (options.enableWriteFileTool) {
-      toolRegistry.register(createWriteFileTool(workspaceRoot));
+    if (!handle.toolRegistry) {
+      throw new Error("Agent Session 未创建 ToolRegistry。");
     }
 
-    const persistedContext = await sessionStore.loadContext(session.id);
-    const agent = createAgent(restoreContextMessages(persistedContext), {
-      systemPrompt: skillPromptBuilder.buildCatalogPrompt(),
-      tools: toolRegistry.createAgentTools({
-        sessionId: session.id,
-        conversationId: session.conversationId,
-        channel: session.channel,
-        userId: session.userId,
-      }),
-      toolExecution: "sequential",
-    });
-    const chat = new ChatService(agent, sessionStore, session.id, {
-      contextManager: new ContextManager(createContextSummarizer()),
-      initialCompaction: persistedContext.compaction,
-      skillPromptBuilder,
-    });
-
-    const broker = approvalBroker;
-    let closed = false;
     return {
-      agent,
-      chat,
-      session,
-      sessionStore,
-      skillRegistry,
-      toolRegistry,
-      approvalBroker: broker,
-      workspaceRoot,
-      close: async () => {
-        if (closed) return;
-        closed = true;
-        try {
-          await broker.close();
-        } finally {
-          sessionStore.close();
-        }
-      },
+      chat: handle,
+      session: handle.session,
+      sessionStore: shared.sessionStore,
+      skillRegistry: shared.skillRegistry,
+      toolRegistry: handle.toolRegistry,
+      approvalBroker: shared.approvalBroker,
+      workspaceRoot: shared.workspaceRoot,
+      close: shared.close,
     };
   } catch (error) {
-    try {
-      if (approvalBroker) await approvalBroker.close();
-    } finally {
-      sessionStore.close();
-    }
+    await shared.close();
     throw error;
   }
 }

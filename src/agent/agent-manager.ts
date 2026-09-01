@@ -58,6 +58,8 @@ export interface AgentManagerOptions {
   readonly sessionStore: SessionStore;
   /** One shared approval broker so approval events cross session boundaries safely. */
   readonly approvalBroker: ApprovalBroker;
+  /** Model persisted on newly created session records by this manager. */
+  readonly model?: string | null;
   /** Creates only the per-session Agent/ChatService/tool binding. */
   readonly createSession: AgentSessionFactory;
   /** Closes shared resources after all resident sessions become idle. */
@@ -97,6 +99,7 @@ export class AgentManager {
   readonly sessionStore: SessionStore;
   readonly approvalBroker: ApprovalBroker;
 
+  private readonly model: string | null | undefined;
   private readonly createSession: AgentSessionFactory;
   private readonly closeResources: () => Promise<void>;
   private readonly entries = new Map<string, SessionEntry>();
@@ -110,6 +113,7 @@ export class AgentManager {
   constructor(options: AgentManagerOptions) {
     this.sessionStore = options.sessionStore;
     this.approvalBroker = options.approvalBroker;
+    this.model = options.model;
     this.createSession = options.createSession;
     this.closeResources = options.closeResources ?? (async () => undefined);
   }
@@ -134,6 +138,7 @@ export class AgentManager {
     const pending = this.initializations.get(descriptor.sessionId);
     if (pending) {
       const entry = await pending;
+      this.assertOpen();
       assertBinding(entry.descriptor, descriptor, entry.session);
       return this.createHandle(entry);
     }
@@ -142,6 +147,7 @@ export class AgentManager {
     this.initializations.set(descriptor.sessionId, initialization);
     try {
       const entry = await initialization;
+      this.assertOpen();
       return this.createHandle(entry);
     } finally {
       if (this.initializations.get(descriptor.sessionId) === initialization) {
@@ -175,6 +181,7 @@ export class AgentManager {
       conversationId: descriptor.conversationId,
       channel: descriptor.channel,
       userId: descriptor.userId,
+      model: this.model,
     };
     const session = await this.sessionStore.getOrCreate(
       descriptor.sessionId,
