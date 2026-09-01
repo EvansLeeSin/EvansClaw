@@ -12,6 +12,7 @@ import type {
 } from "./approval-broker.js";
 import {
   createAuditId,
+  MAX_FULL_AUDIT_ARGS_JSON_BYTES,
   serializeToolArguments,
   type ToolAuditStore,
 } from "./tool-audit.js";
@@ -88,6 +89,7 @@ type RegisteredTool = {
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_RESULT_TEXT_CHARS = 32_000;
 const MAX_APPROVAL_DISPLAY_ARGUMENTS_CHARS = 8_192;
+const MAX_FULL_APPROVAL_DISPLAY_ARGUMENTS_CHARS = 256 * 1024;
 const SENSITIVE_ARGUMENT_KEY =
   /(?:pass(?:word|phrase)?|secret|token|api[-_ ]?key|authorization|cookie|credential|private[-_ ]?key|access[-_ ]?key)/i;
 
@@ -224,7 +226,12 @@ export class ToolRegistry {
             name: definition.name,
             arguments: params as Record<string, unknown>,
           });
-          const auditArguments = serializeToolArguments(validatedParams);
+          const auditArguments = serializeToolArguments(validatedParams, {
+            maxJsonBytes:
+              definition.argumentRetention === "full"
+                ? MAX_FULL_AUDIT_ARGS_JSON_BYTES
+                : undefined,
+          });
           const initialDecision = this.evaluatePolicy(baseContext, summary);
 
           if (initialDecision.action === "deny") {
@@ -253,7 +260,12 @@ export class ToolRegistry {
                   risk: definition.risk,
                   confirmationLevel: confirmation.level,
                   argsHash: auditArguments.hash,
-                  displayArguments: formatToolDisplayArguments(validatedParams),
+                  displayArguments: formatToolDisplayArguments(validatedParams, {
+                    maxChars:
+                      definition.argumentRetention === "full"
+                        ? MAX_FULL_APPROVAL_DISPLAY_ARGUMENTS_CHARS
+                        : undefined,
+                  }),
                   context: {
                     sessionId: baseContext.sessionId,
                     conversationId: baseContext.conversationId,
@@ -415,11 +427,23 @@ export class ToolRegistry {
 }
 
 /**
- * Produces a bounded JSON preview for approval UIs. Values under conventional
- * secret-bearing keys are replaced before serialization; the original params
- * never leave the Registry through this display path.
+ * Produces a bounded JSON preview for approval UIs by default. Values under
+ * conventional secret-bearing keys are replaced before serialization; a tool
+ * may explicitly opt into the larger full-retention ceiling.
  */
-export function formatToolDisplayArguments(value: unknown): string {
+export interface FormatToolDisplayArgumentsOptions {
+  /** Maximum JSON characters retained for an approval display. */
+  maxChars?: number;
+}
+
+export function formatToolDisplayArguments(
+  value: unknown,
+  options: FormatToolDisplayArgumentsOptions = {},
+): string {
+  const maxChars = options.maxChars ?? MAX_APPROVAL_DISPLAY_ARGUMENTS_CHARS;
+  if (!Number.isInteger(maxChars) || maxChars <= 20) {
+    throw new Error("工具审批展示参数上限必须大于 20 的整数。");
+  }
   let json: string | undefined;
   try {
     json = JSON.stringify(toSafeDisplayValue(value));
@@ -427,8 +451,8 @@ export function formatToolDisplayArguments(value: unknown): string {
     return "[参数无法安全展示]";
   }
   if (json === undefined) return "[参数无法安全展示]";
-  if (json.length <= MAX_APPROVAL_DISPLAY_ARGUMENTS_CHARS) return json;
-  return `${json.slice(0, MAX_APPROVAL_DISPLAY_ARGUMENTS_CHARS - 20)}...[展示已截断]`;
+  if (json.length <= maxChars) return json;
+  return `${json.slice(0, maxChars - 20)}...[展示已截断]`;
 }
 
 function validateDefinition(definition: ToolDefinition): void {
@@ -447,6 +471,13 @@ function validateDefinition(definition: ToolDefinition): void {
   }
   if (definition.timeoutMs !== undefined) {
     positiveInteger(definition.timeoutMs, `${definition.name}.timeoutMs`);
+  }
+  if (
+    definition.argumentRetention !== undefined &&
+    definition.argumentRetention !== "bounded" &&
+    definition.argumentRetention !== "full"
+  ) {
+    throw new Error(`工具 ${definition.name} 的参数保留策略无效。`);
   }
 }
 

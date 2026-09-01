@@ -3,6 +3,9 @@ import type { ToolConfirmationLevel } from "./tool-policy.js";
 import type { ApprovalStore } from "./approval-store.js";
 import type { ToolRisk } from "./tool-types.js";
 
+/** Full-retention tools still have a hard approval payload ceiling. */
+const MAX_DISPLAY_ARGUMENTS_CHARS = 256 * 1024;
+
 export type ApprovalDecision = "approve" | "deny";
 export type ApprovalOutcome =
   | "approved"
@@ -445,7 +448,7 @@ function validateRequestInput(input: ApprovalRequestInput): void {
   if (typeof input.displayArguments !== "string") {
     throw new Error("审批请求展示参数格式无效。");
   }
-  if (input.displayArguments.length > 8_192) {
+  if (input.displayArguments.length > MAX_DISPLAY_ARGUMENTS_CHARS) {
     throw new Error("审批请求展示参数过长。");
   }
   for (const [name, value] of [

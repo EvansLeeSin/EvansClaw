@@ -5,12 +5,16 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { Type } from "typebox";
 import { InMemoryApprovalBroker } from "../src/tools/approval-broker.js";
-import { InMemoryToolAuditStore } from "../src/tools/tool-audit.js";
+import {
+  InMemoryToolAuditStore,
+  serializeToolArguments,
+} from "../src/tools/tool-audit.js";
 import {
   createCurrentTimeTool,
   createSessionSearchTool,
 } from "../src/tools/builtin-tools.js";
 import {
+  formatToolDisplayArguments,
   ToolAuthorizationError,
   ToolRegistry,
 } from "../src/tools/tool-registry.js";
@@ -148,6 +152,94 @@ function createWriteDefinition(onExecute: () => void) {
     },
   };
 }
+
+test("工具参数保留策略始终使用完整参数计算 hash", () => {
+  const content = "正文".repeat(10_000);
+  const bounded = serializeToolArguments({ content });
+  const full = serializeToolArguments(
+    { content },
+    { maxJsonBytes: 256 * 1024 },
+  );
+
+  assert.equal(bounded.json, null);
+  assert.ok(full.json);
+  assert.equal(full.hash, bounded.hash);
+
+  const boundedDisplay = formatToolDisplayArguments({ content });
+  const fullDisplay = formatToolDisplayArguments(
+    { content },
+    { maxChars: 256 * 1024 },
+  );
+  assert.match(boundedDisplay, /展示已截断/);
+  assert.doesNotMatch(fullDisplay, /展示已截断/);
+  assert.ok(fullDisplay.includes(content));
+});
+
+test("ToolRegistry 的 full 保留策略保存完整审批和审计参数", async () => {
+  const content = "x".repeat(20_000);
+  const broker = new InMemoryApprovalBroker({
+    createId: () => "approval-full-retention",
+  });
+  const audit = new InMemoryToolAuditStore();
+  const registry = new ToolRegistry({
+    auditStore: audit,
+    approvalBroker: broker,
+    identity: { authenticated: true },
+  });
+  registry.register({
+    name: "full_retention_test",
+    label: "完整参数测试",
+    description: "验证工具可以显式选择完整参数保留。",
+    parameters: Type.Object({ content: Type.String() }),
+    toolset: "core",
+    risk: "write",
+    source: "builtin",
+    argumentRetention: "full",
+    execute: async () => ({
+      content: [{ type: "text" as const, text: "ok" }],
+    }),
+  });
+
+  const tool = registry.createAgentTools(context, {
+    names: ["full_retention_test"],
+  })[0];
+  assert.ok(tool);
+  const requestPromise = new Promise<
+    import("../src/tools/approval-broker.js").ApprovalRequest
+  >((resolve) => {
+    const unsubscribe = broker.subscribe((event) => {
+      if (event.type !== "requested") return;
+      unsubscribe();
+      resolve(event.request);
+    });
+  });
+  const pending = tool.execute(
+    "full-retention-call",
+    { content },
+    new AbortController().signal,
+  );
+  const request = await requestPromise;
+  assert.ok(request.displayArguments.includes(content));
+  assert.doesNotMatch(request.displayArguments, /展示已截断/);
+
+  assert.equal(
+    await broker.resolve({
+      approvalId: request.approvalId,
+      decision: "approve",
+      toolName: request.toolName,
+      argsHash: request.argsHash,
+      actor: context,
+    }),
+    true,
+  );
+  await pending;
+  const record = (await audit.listToolCalls({
+    toolName: "full_retention_test",
+  }))[0];
+  assert.ok(record?.argsJson);
+  assert.ok(record.argsJson.includes(content));
+  await broker.close();
+});
 
 test("ToolRegistry 默认策略拒绝不可信身份的敏感工具", async () => {
   let called = false;

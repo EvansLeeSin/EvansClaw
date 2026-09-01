@@ -8,6 +8,7 @@ import type { Static, TSchema } from "typebox";
 export type ToolRisk = "read" | "write" | "external" | "destructive";
 
 export type ToolSource = "builtin" | "skill" | "plugin" | "mcp";
+export type ToolArgumentRetention = "bounded" | "full";
 
 /**
  * Session identity that is stable for all tool calls made by one Agent.
@@ -47,6 +48,8 @@ export interface ToolDefinition<
   source: ToolSource;
   executionMode?: ToolExecutionMode;
   timeoutMs?: number;
+  /** Controls persisted/displayed argument JSON; hashes always cover full args. */
+  argumentRetention?: ToolArgumentRetention;
   execute(
     params: Static<TParameters>,
     context: ToolInvocationContext,

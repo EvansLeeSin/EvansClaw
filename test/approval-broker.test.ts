@@ -180,7 +180,7 @@ test("已取消的 AbortSignal 不会发布可批准的 pending 请求", async (
 test("Approval Broker 拒绝无效请求和重复 ID", () => {
   const broker = new InMemoryApprovalBroker({ createId: () => "same-id" });
   assert.throws(
-    () => broker.request(input({ displayArguments: "x".repeat(8_193) })),
+    () => broker.request(input({ displayArguments: "x".repeat(256 * 1024 + 1) })),
     /展示参数过长/,
   );
 

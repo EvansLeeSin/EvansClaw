@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 
 const MAX_AUDIT_ARGS_JSON_BYTES = 16 * 1024;
+export const MAX_FULL_AUDIT_ARGS_JSON_BYTES = 256 * 1024;
 
 export type ToolAuditStatus = "started" | "succeeded" | "failed";
 
@@ -53,18 +54,27 @@ export interface ToolAuditStore {
  * Pi schema boundary, but sorting object keys makes the fingerprint independent
  * of provider key order. Arrays retain their original order.
  */
-export function serializeToolArguments(args: unknown): {
+export interface SerializeToolArgumentsOptions {
+  /** Bounded retention for the persisted JSON; the hash is always complete. */
+  maxJsonBytes?: number;
+}
+
+export function serializeToolArguments(
+  args: unknown,
+  options: SerializeToolArgumentsOptions = {},
+): {
   hash: string;
   json: string | null;
 } {
   const json = JSON.stringify(stableJsonValue(args));
   const hash = createHash("sha256").update(json).digest("hex");
+  const maxJsonBytes = options.maxJsonBytes ?? MAX_AUDIT_ARGS_JSON_BYTES;
+  if (!Number.isInteger(maxJsonBytes) || maxJsonBytes <= 0) {
+    throw new Error("工具审计参数 JSON 上限必须是正整数。");
+  }
   return {
     hash,
-    json:
-      Buffer.byteLength(json, "utf8") <= MAX_AUDIT_ARGS_JSON_BYTES
-        ? json
-        : null,
+    json: Buffer.byteLength(json, "utf8") <= maxJsonBytes ? json : null,
   };
 }
 
