@@ -1,4 +1,5 @@
 import { createAgentManagerRuntime } from "./agent-manager-runtime.js";
+import type { Agent } from "@earendil-works/pi-agent-core";
 import type { AgentSessionHandle } from "../agent/agent-manager.js";
 import type { InMemoryApprovalBroker } from "../tools/approval-broker.js";
 import type { ToolRegistry } from "../tools/tool-registry.js";
@@ -29,6 +30,8 @@ export interface ChatRuntimeOptions {
  * invoking the underlying pi Agent directly.
  */
 export interface ChatRuntime {
+  /** @deprecated Use chat.send/reset; kept for trusted host compatibility. */
+  readonly agent: Agent;
   readonly chat: AgentSessionHandle;
   readonly session: SessionRecord;
   readonly sessionStore: SqliteSessionStore;
@@ -64,8 +67,13 @@ export async function createChatRuntime(
     if (!handle.toolRegistry) {
       throw new Error("Agent Session 未创建 ToolRegistry。");
     }
+    const agent = shared.manager.getCompatibilityAgent(handle.session.id);
+    if (!agent) {
+      throw new Error("Agent Session 未提供兼容 Agent。");
+    }
 
     return {
+      agent,
       chat: handle,
       session: handle.session,
       sessionStore: shared.sessionStore,

@@ -1,3 +1,4 @@
+import type { Agent } from "@earendil-works/pi-agent-core";
 import type { ChatService, TextDeltaHandler } from "../chat/chat-service.js";
 import type {
   ApprovalBroker,
@@ -34,6 +35,8 @@ export interface AgentControl {
 /** A per-session runtime assembled by the application layer. */
 export interface AgentSessionRuntime {
   readonly agent: AgentControl;
+  /** Only populated for the trusted single-session compatibility wrapper. */
+  readonly rawAgent?: Agent;
   readonly chat: Pick<ChatService, "send" | "reset">;
   /** Exposed for trusted host wiring and diagnostics, not for prompt execution. */
   readonly toolRegistry?: ToolRegistry;
@@ -154,6 +157,15 @@ export class AgentManager {
         this.initializations.delete(descriptor.sessionId);
       }
     }
+  }
+
+  /**
+   * Compatibility-only access for createChatRuntime. Channel adapters should use
+   * AgentSessionHandle and never call the underlying Agent directly.
+   */
+  getCompatibilityAgent(sessionId: string): Agent | undefined {
+    if (this.closed) return undefined;
+    return this.entries.get(sessionId)?.runtime.rawAgent;
   }
 
   /** Look up only a resident session; this method never opens a database session. */

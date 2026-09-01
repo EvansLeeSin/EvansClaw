@@ -196,6 +196,7 @@ async function createSessionRuntime(
       abort: () => agent.abort(),
       waitForIdle: () => agent.waitForIdle(),
     },
+    rawAgent: agent,
     chat,
     toolRegistry,
   };
