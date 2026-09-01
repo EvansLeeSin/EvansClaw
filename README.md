@@ -133,7 +133,7 @@ skills/<skill-name>/SKILL.md
 2. 增加 Telegram 或飞书 Channel Adapter
 3. 增加长期记忆、定时任务和事件触发
 
-Tool Policy、审批 Broker、审批持久化和 Web 审批交互已完成；当前仍只注册三个只读工具。
+Tool Policy、审批 Broker、审批持久化和 Web 审批交互已完成；CLI 仍只注册三个只读工具，Web 另外注册受审批保护的 `write_file`。
 
 会话数据库默认保存到：
 

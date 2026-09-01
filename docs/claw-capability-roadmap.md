@@ -73,7 +73,7 @@ CLI / Telegram / 飞书 / Web / Cron
 | 2 | Context 压缩 | 会话结构化存储、模型调用 | 高 | 已完成基础实现 |
 | 3 | Skills 按需加载 | Prompt 构造、文件读取 | 中 | 已完成基础实现 |
 | 4 | Tool Registry | Agent Tool API、TypeBox、SessionStore | 高 | 已完成基础实现 |
-| 5 | Tool Policy 和人工确认 | Tool Registry、身份上下文 | 高 | Policy、Broker、Web 审批已完成，真实副作用工具待接入 |
+| 5 | Tool Policy 和人工确认 | Tool Registry、身份上下文 | 高 | Policy、Broker、Web 审批和受隔离的 `write_file` 已完成 |
 | 6 | Channel Gateway | AgentManager、Policy | 高 | Web 基础 Gateway 已完成，外部渠道待实现 |
 | 7 | Cron 定时任务 | Gateway、会话/任务存储 | 中 | 待实现 |
 | 8 | 长期记忆和用户画像 | SQLite、检索、Policy | 中 | 待实现 |

@@ -3,7 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { assertConfig } from "./config.js";
 import { createChatRuntime } from "./app/chat-runtime.js";
-import { WebGateway } from "./gateway/web-gateway.js";
+import { createWebGateway } from "./gateway/web-runtime.js";
 
 const DEFAULT_WEB_SESSION_ID = "web:local:personal";
 const DEFAULT_WEB_HOST = "127.0.0.1";
@@ -70,10 +70,7 @@ async function main(): Promise<void> {
     enableWriteFileTool: true,
     workspaceRoot: process.env.EVANSCLAW_WORKSPACE_DIR,
   });
-  const gateway = new WebGateway({
-    chat: runtime.chat,
-    sessionStore: runtime.sessionStore,
-    session: runtime.session,
+  const gateway = createWebGateway(runtime, {
     host,
     port,
     corsOrigin,
