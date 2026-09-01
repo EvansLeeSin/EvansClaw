@@ -18,9 +18,17 @@ import { SkillPromptBuilder } from "../skills/skill-prompt.js";
 import { SkillRegistry } from "../skills/skill-registry.js";
 import { createBuiltinTools } from "../tools/builtin-tools.js";
 import { InMemoryApprovalBroker } from "../tools/approval-broker.js";
+import { createWriteFileTool } from "../tools/file-tools.js";
 import { ToolRegistry } from "../tools/tool-registry.js";
 
 const projectRoot = resolve(import.meta.dirname, "../..");
+export const DEFAULT_WORKSPACE_ROOT = resolve(projectRoot, "data", "workspace");
+
+/** Resolves the operator-selected workspace without creating it. */
+export function resolveWorkspaceRoot(configured?: string): string {
+  const value = configured?.trim() || process.env.EVANSCLAW_WORKSPACE_DIR?.trim();
+  return value ? resolve(value) : DEFAULT_WORKSPACE_ROOT;
+}
 
 export interface ChatRuntimeOptions {
   databasePath?: string;
@@ -30,6 +38,10 @@ export interface ChatRuntimeOptions {
   userId: string;
   /** 当前入口是否代表已确认的本地用户；默认不可信。 */
   authenticated?: boolean;
+  /** 仅具有审批通道的入口可以启用本地写文件工具。 */
+  enableWriteFileTool?: boolean;
+  /** 未提供时使用 EVANSCLAW_WORKSPACE_DIR 或 data/workspace。 */
+  workspaceRoot?: string;
 }
 
 /**
@@ -44,6 +56,7 @@ export interface ChatRuntime {
   readonly skillRegistry: SkillRegistry;
   readonly toolRegistry: ToolRegistry;
   readonly approvalBroker: InMemoryApprovalBroker;
+  readonly workspaceRoot: string;
   close(): Promise<void>;
 }
 
@@ -53,6 +66,7 @@ export async function createChatRuntime(
   const sessionStore = new SqliteSessionStore(
     options.databasePath ?? resolve(projectRoot, "data", "evansclaw.sqlite"),
   );
+  const workspaceRoot = resolveWorkspaceRoot(options.workspaceRoot);
   let approvalBroker: InMemoryApprovalBroker | undefined;
 
   try {
@@ -92,6 +106,9 @@ export async function createChatRuntime(
       identity: { authenticated: options.authenticated ?? false },
     });
     toolRegistry.registerMany(createBuiltinTools(skillRegistry, sessionStore));
+    if (options.enableWriteFileTool) {
+      toolRegistry.register(createWriteFileTool(workspaceRoot));
+    }
 
     const persistedContext = await sessionStore.loadContext(session.id);
     const agent = createAgent(restoreContextMessages(persistedContext), {
@@ -120,6 +137,7 @@ export async function createChatRuntime(
       skillRegistry,
       toolRegistry,
       approvalBroker: broker,
+      workspaceRoot,
       close: async () => {
         if (closed) return;
         closed = true;

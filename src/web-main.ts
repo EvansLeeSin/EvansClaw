@@ -66,6 +66,9 @@ async function main(): Promise<void> {
     userId: "local",
     // 当前 Web Gateway 是单会话个人入口；后续多用户适配器不能继承此信任。
     authenticated: true,
+    // Web 已有审批 API/SSE；CLI 没有审批通道，因此只在 Web 装配写文件工具。
+    enableWriteFileTool: true,
+    workspaceRoot: process.env.EVANSCLAW_WORKSPACE_DIR,
   });
   const gateway = new WebGateway({
     chat: runtime.chat,

@@ -112,7 +112,7 @@ npm run dev:ui      # 终端 2：Vite http://localhost:5173，/api 代理到 878
 
 无 API Key 时可用 mock Gateway 联调：`cd web && npm run mock`，并用 `npm run smoke` 跑无头浏览器冒烟测试。审批中的写入/外部操作会通过 SSE 推送审批卡片，浏览器只提交批准或拒绝决策。
 
-默认 Web 会话为 `web:local:personal`，与 CLI 的 `personal` 会话分开。可通过 `EVANSCLAW_WEB_HOST`、`EVANSCLAW_WEB_PORT`、`EVANSCLAW_WEB_CORS_ORIGIN` 和 `EVANSCLAW_WEB_SESSION_ID` 配置。`EVANSCLAW_WEB_STATIC_DIR` 可覆盖默认的 `web/dist` 静态目录；显式目录无效时启动会失败并给出错误。Gateway 默认只监听本机且没有认证，不应直接暴露到公网。
+默认 Web 会话为 `web:local:personal`，与 CLI 的 `personal` 会话分开。可通过 `EVANSCLAW_WEB_HOST`、`EVANSCLAW_WEB_PORT`、`EVANSCLAW_WEB_CORS_ORIGIN` 和 `EVANSCLAW_WEB_SESSION_ID` 配置。`EVANSCLAW_WEB_STATIC_DIR` 可覆盖默认的 `web/dist` 静态目录；显式目录无效时启动会失败并给出错误。Web 的 `write_file` 默认工作区为 `data/workspace`，可通过 `EVANSCLAW_WORKSPACE_DIR` 配置。Gateway 默认只监听本机且没有认证，不应直接暴露到公网。
 
 ## Skills
 
@@ -141,4 +141,4 @@ Tool Policy、审批 Broker、审批持久化和 Web 审批交互已完成；当
 data/evansclaw.sqlite
 ```
 
-当前版本没有启用副作用工具；只注册 `load_skill`、`search_session` 和 `current_time` 三个只读工具，不会执行文件、Shell、网络发送或其他写入操作。工具调用审计保存在会话数据库的 `tool_calls` 表中。
+CLI 入口只注册 `load_skill`、`search_session` 和 `current_time` 三个只读工具。Web 入口另外注册受审批保护的 `write_file`，默认只能写入 `data/workspace`（可由 `EVANSCLAW_WORKSPACE_DIR` 覆盖），不会执行 Shell、网络发送或其他外部通信。工具调用审计保存在会话数据库的 `tool_calls` 表中；写文件的审批和审计会按当前配置保留完整参数。

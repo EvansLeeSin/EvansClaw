@@ -451,7 +451,7 @@ result_metadata_json, started_at, finished_at
 
 - Registry 直接适配 Pi `AgentTool`，不重新实现 Agent Loop。
 - Agent 全局工具执行默认是 `sequential`；定义仍可表达 `parallel`，但在只读并行策略明确前不开放副作用工具。
-- 当前没有 MCP、远程插件发现、文件/Shell/消息等副作用工具。
+- 当前仅有模块五/D9 提供的受隔离工作区 `write_file`；尚无 MCP、远程插件发现、Shell、消息或外部 API 工具。
 - `allow / deny / ask` 策略、人工确认和审批持久化由模块五提供；Registry 通过授权闸门调用它们。
 - 工具调用超时、取消或异常会结束本次调用并留下失败审计，不会让主进程崩溃。
 - 工具输出有大小上限，避免一次调用直接膨胀上下文。
@@ -472,7 +472,7 @@ result_metadata_json, started_at, finished_at
 
 ### 状态：基础实现已完成
 
-D1–D8 已完成：Policy、Approval Broker、SQLite 审批持久化、ToolRegistry 授权闸门、Runtime 装配、Web 审批 API/SSE 和 React 审批卡片均已接通。当前仍没有真实的写入、外部通信或破坏性工具；这些工具接入时必须继续声明风险并经过同一闸门。
+D1–D9-C 已完成：Policy、Approval Broker、SQLite 审批持久化、ToolRegistry 授权闸门、Runtime 装配、Web 审批 API/SSE、React 审批卡片和受隔离工作区约束的 `write_file` 均已接通。当前仍没有 Shell、外部通信或破坏性工具；这些工具接入时必须继续声明风险并经过同一闸门。
 
 ### 目标
 
@@ -506,6 +506,7 @@ D1–D8 已完成：Policy、Approval Broker、SQLite 审批持久化、ToolRegi
 - `src/tools/approval-broker.ts`：一次性审批等待、绑定校验、超时、取消、事件和并发终态仲裁；持久化模式下先落 pending，再发布事件，终态落库失败绝不返回 approved。
 - `src/tools/approval-store.ts`：内存和 SQLite 审批存储；审批表只保存 `argsHash` 与脱敏展示参数，重启时旧 owner 的 pending 请求标记为 expired。
 - `src/tools/tool-registry.ts`：参数校验后进入 Policy；`ask` 没有 Broker 时 fail closed，批准后再次检查 Policy，只有真正获准才开始工具审计和执行。
+- `src/tools/file-tools.ts`：只允许在隔离 workspace 内写入 UTF-8 文本；`create`/`overwrite` 语义、路径和符号链接检查、大小限制与原子写入均在工具边界内执行。
 - `src/gateway/web-gateway.ts`：提供当前 Web 会话的审批列表/解决 API，以及 `approval_required` / `approval_resolved` SSE 事件；浏览器断线会取消本轮 pending 审批。
 - `web/src/components/chat/approval-card.tsx`：只渲染脱敏参数，提供一次性允许/拒绝按钮；前端不提交绑定字段，也不自行判断过期。
 
@@ -533,8 +534,10 @@ D1–D8 已完成：Policy、Approval Broker、SQLite 审批持久化、ToolRegi
 
 ### 当前限制
 
-- 尚未接入真实的文件写入、Shell、消息发送或外部 API 工具。
+- `write_file` 目前只在 Web Runtime 注册，CLI 尚未提供终端审批交互。
+- 尚未接入 Shell、消息发送或外部 API 工具。
 - Web Gateway 仍是本机单会话、无认证入口，只适合本机或受信任开发环境。
+- 当前写文件审批/审计按配置保留完整参数，数据库尚无加密和自动清理策略。
 
 ---
 
@@ -554,6 +557,7 @@ D1–D8 已完成：Policy、Approval Broker、SQLite 审批持久化、ToolRegi
 - `GET /api/approvals`：查询当前会话的脱敏 pending 审批；
 - `POST /api/approvals/:approvalId`：只提交 `approve`/`deny` 决策，绑定字段由服务端恢复；
 - `POST /api/sessions/:id/reset`；
+- Web Runtime 默认注册受审批保护的 `write_file`，工作区由 `EVANSCLAW_WORKSPACE_DIR` 或 `data/workspace` 决定；
 - CORS、请求体大小限制、输入校验和同一会话串行队列；
 - 同源静态托管：非 `/api` 的 GET/HEAD 请求从 `web/dist` 返回，支持 MIME、Vite `assets/` 长缓存、SPA `index.html` 回退和路径穿越防护。
 
