@@ -180,7 +180,7 @@ export class AgentManager {
       descriptor.sessionId,
       metadata,
     );
-    assertBinding(descriptor, descriptor, session);
+    assertSessionRecordBinding(descriptor, session);
 
     const runtime = await this.createSession(descriptor, session);
     if (this.closed) {
@@ -318,19 +318,46 @@ function assertBinding(
   session: SessionRecord,
 ): void {
   if (
-    session.id !== expected.sessionId ||
-    session.channel !== expected.channel ||
-    session.conversationId !== expected.conversationId ||
-    session.userId !== expected.userId ||
-    expected.sessionId !== actual.sessionId ||
-    expected.channel !== actual.channel ||
-    expected.conversationId !== actual.conversationId ||
-    expected.userId !== actual.userId ||
-    expected.identity.authenticated !== actual.identity.authenticated ||
-    expected.profile !== actual.profile
+    !sameDescriptorBinding(expected, actual) ||
+    !sameSessionRecordBinding(expected, session)
   ) {
     throw new AgentSessionBindingError(expected.sessionId);
   }
+}
+
+function assertSessionRecordBinding(
+  descriptor: Required<AgentSessionDescriptor>,
+  session: SessionRecord,
+): void {
+  if (!sameSessionRecordBinding(descriptor, session)) {
+    throw new AgentSessionBindingError(descriptor.sessionId);
+  }
+}
+
+function sameDescriptorBinding(
+  left: Required<AgentSessionDescriptor>,
+  right: Required<AgentSessionDescriptor>,
+): boolean {
+  return (
+    left.sessionId === right.sessionId &&
+    left.channel === right.channel &&
+    left.conversationId === right.conversationId &&
+    left.userId === right.userId &&
+    left.identity.authenticated === right.identity.authenticated &&
+    left.profile === right.profile
+  );
+}
+
+function sameSessionRecordBinding(
+  descriptor: Required<AgentSessionDescriptor>,
+  session: SessionRecord,
+): boolean {
+  return (
+    session.id === descriptor.sessionId &&
+    session.channel === descriptor.channel &&
+    session.conversationId === descriptor.conversationId &&
+    session.userId === descriptor.userId
+  );
 }
 
 function requiredText(value: unknown, name: string): string {
