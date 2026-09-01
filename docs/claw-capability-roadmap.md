@@ -74,7 +74,7 @@ CLI / Telegram / 飞书 / Web / Cron
 | 3 | Skills 按需加载 | Prompt 构造、文件读取 | 中 | 已完成基础实现 |
 | 4 | Tool Registry | Agent Tool API、TypeBox、SessionStore | 高 | 已完成基础实现 |
 | 5 | Tool Policy 和人工确认 | Tool Registry、身份上下文 | 高 | Policy、Broker、Web 审批和受隔离的 `write_file` 已完成 |
-| 6 | Channel Gateway | AgentManager、Policy | 高 | Web 基础 Gateway 已完成，外部渠道待实现 |
+| 6 | Channel Gateway | AgentManager、Policy | 高 | AgentManager 核心已完成，Web 基础 Gateway 单会话，外部渠道待实现 |
 | 7 | Cron 定时任务 | Gateway、会话/任务存储 | 中 | 待实现 |
 | 8 | 长期记忆和用户画像 | SQLite、检索、Policy | 中 | 待实现 |
 
@@ -543,9 +543,12 @@ D1–D9-C 已完成：Policy、Approval Broker、SQLite 审批持久化、ToolRe
 
 ## 9. 模块六：Channel Gateway
 
-### 当前状态：轻量 Web Gateway 已完成，完整 Channel Gateway 待实现
+### 当前状态：AgentManager 与轻量 Web Gateway 已完成，完整 Channel Gateway 待实现
 
 当前已新增：
+
+- `src/agent/agent-manager.ts`：进程级会话管理、一次初始化、绑定校验、session 级串行队列和关闭生命周期；
+- `src/app/agent-manager-runtime.ts`：共享 SQLite、审批 Broker、Skill 和模型资源，并为每个 session 创建独立 Agent/ChatService/ToolRegistry；
 
 - `src/gateway/web-gateway.ts`：Node.js 内置 `node:http` 实现的本地 HTTP Gateway；
 - `src/web-main.ts`：独立 Web Gateway 启动入口；
@@ -569,7 +572,7 @@ npm run web
 
 `npm run web` 的 `preweb` 生命周期会先执行 `build:ui`，因此一个命令即可构建前端并启动完整应用；浏览器直接访问 `http://127.0.0.1:8787`。缺少 `web/dist` 时 `dev:web` 仍可退化为纯 API 模式。默认静态目录可用 `EVANSCLAW_WEB_STATIC_DIR` 覆盖，显式目录无效时启动失败。
 
-默认监听 `127.0.0.1:8787`，可通过 `EVANSCLAW_WEB_HOST`、`EVANSCLAW_WEB_PORT`、`EVANSCLAW_WEB_CORS_ORIGIN` 和 `EVANSCLAW_WEB_SESSION_ID` 配置。当前 Gateway 没有认证，只适合本机或受信任的开发环境；它只暴露一个配置好的 Web 会话，不支持多用户、多会话动态创建和外部平台适配。
+默认监听 `127.0.0.1:8787`，可通过 `EVANSCLAW_WEB_HOST`、`EVANSCLAW_WEB_PORT`、`EVANSCLAW_WEB_CORS_ORIGIN` 和 `EVANSCLAW_WEB_SESSION_ID` 配置。当前 Gateway 没有认证，只适合本机或受信任的开发环境；它只暴露一个配置好的 Web 会话，不支持多用户、多会话动态创建和外部平台适配。多会话能力由进程级 AgentManager 提供，动态 Web 路由仍待实现。
 
 ### 当前状态：Web 前端（web/）已完成基础聊天界面
 

@@ -8,7 +8,7 @@
 - `deepseek-v4-flash` 和 `deepseek-v4-pro` 模型
 - CLI 交互式聊天
 - 流式输出
-- 单个个人会话
+- 进程内多个独立会话的 `AgentManager`（CLI/Web 兼容入口当前默认单会话）
 - 基于 `sessions` / `messages` 的结构化 SQLite 会话持久化
 - 按轮次批量追加消息，保留完整 `AgentMessage` JSON
 - FTS5 全文搜索、中文 trigram 搜索与 LIKE 兜底
@@ -23,6 +23,7 @@
 - SQLite `tool_calls` 工具调用审计
 - 轻量本地 Web Gateway（HTTP JSON API + SSE 流式回复）
 - Vite + React + shadcn/ui Web 聊天界面（Gateway 同源静态托管）
+- 共享 SQLite/审批资源、按 session 隔离的 Agent/ChatService 与串行队列
 - 可扩展的 `ChatService` 业务边界
 
 DeepSeek 请求地址：
@@ -127,9 +128,30 @@ skills/<skill-name>/SKILL.md
 
 当前不会执行 Skill 目录中的脚本，也不会因为 Skill 的 `allowed-tools` 声明自动授予工具权限。
 
+## AgentManager（进程内多会话）
+
+生产装配可使用 `createAgentManagerRuntime()` 创建一个进程级 Manager：
+
+```ts
+const runtime = await createAgentManagerRuntime({
+  databasePath: "data/evansclaw.sqlite",
+});
+const session = await runtime.manager.getOrCreate({
+  sessionId: "telegram:user:123456",
+  channel: "telegram",
+  conversationId: "123456",
+  userId: "123456",
+  identity: { authenticated: true },
+  profile: "read-only",
+});
+await session.send("你好", (delta) => process.stdout.write(delta));
+```
+
+一个 Manager 共享一个 `SqliteSessionStore` 和一个 `ApprovalBroker`；每个 session 拥有独立 Agent、ChatService 和 ToolRegistry。同一 session 串行执行，不同 session 可以并行。`sessionId` 应由可信的 Gateway/Adapter 生成，不能由用户文本决定。
+
 ## 后续设计方向
 
-1. 为每个外部聊天会话维护独立 Agent
+1. 增加动态多会话 Web 路由
 2. 增加 Telegram 或飞书 Channel Adapter
 3. 增加长期记忆、定时任务和事件触发
 
