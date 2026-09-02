@@ -586,7 +586,6 @@ export class SqliteSessionStore
   private readonly database: DatabaseSync;
   private readonly approvalOwnerId = randomUUID();
   private readonly getSessionStatement: StatementSync;
-  private readonly listSessionsStatement: StatementSync;
   private readonly insertSessionStatement: StatementSync;
   private readonly updateSessionMetadataStatement: StatementSync;
   private readonly loadMessagesStatement: StatementSync;
@@ -641,22 +640,6 @@ export class SqliteSessionStore
         message_count
       FROM sessions
       WHERE id = ?
-    `);
-    this.listSessionsStatement = this.database.prepare(`
-      SELECT
-        id,
-        conversation_id,
-        channel,
-        user_id,
-        title,
-        model,
-        created_at,
-        updated_at,
-        parent_session_id,
-        message_count
-      FROM sessions
-      ORDER BY updated_at DESC, created_at DESC
-      LIMIT ?
     `);
     this.insertSessionStatement = this.database.prepare(`
       INSERT INTO sessions (
@@ -891,11 +874,38 @@ export class SqliteSessionStore
 
   async listSessions(options: SessionListOptions = {}): Promise<SessionRecord[]> {
     const limit = clampSessionListLimit(options.limit);
-    const rows = this.listSessionsStatement.all(limit) as unknown as SessionRow[];
-    return rows
-      .filter((row) => !options.channel || row.channel === options.channel)
-      .filter((row) => !options.userId || row.user_id === options.userId)
-      .map((row) => this.toSessionRecord(row));
+    const where: string[] = [];
+    const parameters: Array<string | number> = [];
+    if (options.channel) {
+      where.push("channel = ?");
+      parameters.push(options.channel);
+    }
+    if (options.userId) {
+      where.push("user_id = ?");
+      parameters.push(options.userId);
+    }
+    parameters.push(limit);
+
+    const rows = this.database
+      .prepare(`
+        SELECT
+          id,
+          conversation_id,
+          channel,
+          user_id,
+          title,
+          model,
+          created_at,
+          updated_at,
+          parent_session_id,
+          message_count
+        FROM sessions
+        ${where.length > 0 ? `WHERE ${where.join(" AND ")}` : ""}
+        ORDER BY updated_at DESC, created_at DESC, id DESC
+        LIMIT ?
+      `)
+      .all(...parameters) as unknown as SessionRow[];
+    return rows.map((row) => this.toSessionRecord(row));
   }
 
   async load(sessionId: string): Promise<AgentMessage[]> {

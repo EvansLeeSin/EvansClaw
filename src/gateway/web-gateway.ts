@@ -878,13 +878,20 @@ function isJsonObject(value: unknown): value is JsonObject {
 }
 
 function isSafeSessionId(value: string): boolean {
-  return (
-    value.length > 0 &&
-    value.length <= 256 &&
-    value !== "." &&
-    value !== ".." &&
-    !/[\\/\\0-\\x1f\\x7f]/u.test(value)
-  );
+  if (
+    value.length === 0 ||
+    value.length > 256 ||
+    value === "." ||
+    value === ".." ||
+    value.includes("/") ||
+    value.includes("\\")
+  ) {
+    return false;
+  }
+  return [...value].every((character) => {
+    const code = character.codePointAt(0) ?? 0;
+    return code >= 0x20 && code !== 0x7f;
+  });
 }
 
 function writeSse(

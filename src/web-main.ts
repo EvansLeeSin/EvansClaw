@@ -2,8 +2,8 @@ import { stat } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { assertConfig } from "./config.js";
-import { createChatRuntime } from "./app/chat-runtime.js";
-import { createWebGateway } from "./gateway/web-runtime.js";
+import { createAgentManagerRuntime } from "./app/agent-manager-runtime.js";
+import { createDynamicWebGateway } from "./gateway/web-runtime.js";
 
 const DEFAULT_WEB_SESSION_ID = "web:local:personal";
 const DEFAULT_WEB_HOST = "127.0.0.1";
@@ -59,22 +59,36 @@ async function main(): Promise<void> {
 
   // 静态目录属于启动配置，先于数据库/Agent 运行时校验，失败时不遗留资源。
   const staticDir = await resolveStaticDir();
-  const runtime = await createChatRuntime({
-    sessionId,
-    conversationId: sessionId,
-    channel: "web",
-    userId: "local",
-    // 当前 Web Gateway 是单会话个人入口；后续多用户适配器不能继承此信任。
-    authenticated: true,
-    // Web 已有审批 API/SSE；CLI 没有审批通道，因此只在 Web 装配写文件工具。
-    enableWriteFileTool: true,
+  const runtime = await createAgentManagerRuntime({
     workspaceRoot: process.env.EVANSCLAW_WORKSPACE_DIR,
   });
-  const gateway = createWebGateway(runtime, {
+  try {
+    // 保留配置的默认会话，让升级后的 UI 首次打开仍能看到原有历史；
+    // 之后浏览器可以通过 POST /api/sessions 创建更多独立会话。
+    await runtime.manager.getOrCreate({
+      sessionId,
+      conversationId: sessionId,
+      channel: "web",
+      userId: "local",
+      // 当前 Web Gateway 是本机个人入口；后续多用户适配器不能继承此信任。
+      identity: { authenticated: true },
+      // Web 已有审批 API/SSE；CLI 没有审批通道，因此只在 Web 装配写文件工具。
+      profile: "web-workspace",
+    });
+  } catch (error) {
+    await runtime.close();
+    throw error;
+  }
+  const gateway = createDynamicWebGateway(runtime, {
     host,
     port,
     corsOrigin,
     staticDir,
+    channel: "web",
+    userId: "local",
+    identity: { authenticated: true },
+    profile: "web-workspace",
+    defaultSessionId: sessionId,
   });
 
   let closing = false;

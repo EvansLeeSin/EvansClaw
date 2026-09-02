@@ -1,3 +1,6 @@
+import type {
+  AgentManagerRuntime,
+} from "../app/agent-manager-runtime.js";
 import type { ChatRuntime } from "../app/chat-runtime.js";
 import {
   WebGateway,
@@ -16,7 +19,7 @@ export function createWebGateway(
   >,
   options: Omit<
     WebGatewayOptions,
-    "chat" | "sessionStore" | "session" | "approvalBroker"
+    "chat" | "sessionStore" | "session" | "approvalBroker" | "manager"
   > = {},
 ): WebGateway {
   return new WebGateway({
@@ -24,6 +27,29 @@ export function createWebGateway(
     chat: runtime.chat,
     sessionStore: runtime.sessionStore,
     session: runtime.session,
+    approvalBroker: runtime.approvalBroker,
+  });
+}
+
+/**
+ * Compose the dynamic multi-session Web Gateway from one process-level runtime.
+ * The runtime owns the shared Store/Broker; the Gateway only supplies the
+ * trusted Web scope and lets AgentManager resolve each requested session.
+ */
+export function createDynamicWebGateway(
+  runtime: Pick<
+    AgentManagerRuntime,
+    "manager" | "sessionStore" | "approvalBroker"
+  >,
+  options: Omit<
+    WebGatewayOptions,
+    "chat" | "session" | "sessionStore" | "manager" | "approvalBroker"
+  > = {},
+): WebGateway {
+  return new WebGateway({
+    ...options,
+    manager: runtime.manager,
+    sessionStore: runtime.sessionStore,
     approvalBroker: runtime.approvalBroker,
   });
 }

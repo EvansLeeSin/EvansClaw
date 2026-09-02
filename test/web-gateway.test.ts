@@ -9,6 +9,7 @@ import {
   type SessionRecord,
 } from "../src/session/session-store.js";
 import { InMemoryApprovalBroker } from "../src/tools/approval-broker.js";
+import { AgentManager } from "../src/agent/agent-manager.js";
 import { WebGateway } from "../src/gateway/web-gateway.js";
 
 async function createFixture(options?: { staticDir?: string }) {
@@ -56,6 +57,87 @@ async function createFixture(options?: { staticDir?: string }) {
     },
     get resetCount() {
       return resetCount;
+    },
+  };
+}
+
+async function createDynamicFixture(options?: { approvals?: boolean }) {
+  const sessionStore = new InMemorySessionStore();
+  const approvalBroker = new InMemoryApprovalBroker();
+  const sent: string[] = [];
+  let activeTurns = 0;
+  let maximumActiveTurns = 0;
+  let nextSessionNumber = 0;
+  let nextApprovalNumber = 0;
+  const manager = new AgentManager({
+    sessionStore,
+    approvalBroker,
+    createSession: async (_descriptor, session) => ({
+      agent: {
+        abort() {},
+        async waitForIdle() {},
+      },
+      chat: {
+        async send(text: string, onTextDelta: (delta: string) => void) {
+          sent.push(`${session.id}:${text}`);
+          activeTurns += 1;
+          maximumActiveTurns = Math.max(maximumActiveTurns, activeTurns);
+          try {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+            if (options?.approvals && text === "审批") {
+              const result = await approvalBroker.request({
+                requestId: `dynamic-request-${++nextApprovalNumber}`,
+                toolCallId: `dynamic-tool-call-${nextApprovalNumber}`,
+                toolName: "write_test",
+                toolLabel: "写入测试",
+                toolset: "core",
+                risk: "write",
+                confirmationLevel: "standard",
+                argsHash: "dynamic-args-hash",
+                displayArguments: '{"token":"[已隐藏]"}',
+                context: {
+                  sessionId: session.id,
+                  conversationId: session.conversationId,
+                  channel: session.channel,
+                  userId: session.userId,
+                },
+                expiresInMs: 5_000,
+              });
+              onTextDelta(`审批：${result.outcome}`);
+              return;
+            }
+            onTextDelta(`回复：${session.id}:${text}`);
+          } finally {
+            activeTurns -= 1;
+          }
+        },
+        async reset() {},
+      },
+    }),
+  });
+  const gateway = new WebGateway({
+    manager,
+    sessionStore,
+    approvalBroker,
+    channel: "web",
+    userId: "local",
+    identity: { authenticated: true },
+    profile: "read-only",
+    createSessionId: () => `web:dynamic-${++nextSessionNumber}`,
+    host: "127.0.0.1",
+    port: 0,
+  });
+  const address = await gateway.listen();
+
+  return {
+    address,
+    gateway,
+    manager,
+    approvalBroker,
+    sessionStore,
+    sent,
+    get maximumActiveTurns() {
+      return maximumActiveTurns;
     },
   };
 }
@@ -119,6 +201,148 @@ async function createApprovalFixture() {
     },
   };
 }
+
+test("动态 Web Gateway 创建并隔离多个 session", async () => {
+  const fixture = await createDynamicFixture();
+  try {
+    const initial = await fetch(`${fixture.address.url}/api/sessions`);
+    assert.equal(initial.status, 200);
+    assert.deepEqual(await initial.json(), { sessions: [] });
+
+    const firstResponse = await fetch(`${fixture.address.url}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      // 客户端提供的 sessionId 会被忽略，ID 始终由服务端生成。
+      body: JSON.stringify({ sessionId: "forged" }),
+    });
+    const firstResponseBody = await firstResponse.text();
+    assert.equal(firstResponse.status, 201, firstResponseBody);
+    const first = (JSON.parse(firstResponseBody) as { session: SessionRecord }).session;
+    assert.equal(first.id, "web:dynamic-1");
+    assert.equal(first.userId, "local");
+
+    const secondResponse = await fetch(`${fixture.address.url}/api/sessions`, {
+      method: "POST",
+    });
+    assert.equal(secondResponse.status, 201);
+    const second = ((await secondResponse.json()) as { session: SessionRecord }).session;
+    assert.equal(second.id, "web:dynamic-2");
+
+    const sessions = await fetch(`${fixture.address.url}/api/sessions`);
+    const listed = (await sessions.json()) as { sessions: SessionRecord[] };
+    assert.deepEqual(
+      listed.sessions.map((session) => session.id).sort(),
+      [first.id, second.id].sort(),
+    );
+
+    const foreign = await fixture.sessionStore.getOrCreate("web:foreign", {
+      conversationId: "web:foreign",
+      channel: "web",
+      userId: "someone-else",
+    });
+    assert.equal(foreign.userId, "someone-else");
+    const hidden = await fetch(
+      `${fixture.address.url}/api/sessions/${encodeURIComponent(foreign.id)}/messages`,
+    );
+    assert.equal(hidden.status, 404);
+
+    const firstMessages = await fetch(
+      `${fixture.address.url}/api/sessions/${encodeURIComponent(first.id)}/messages`,
+    );
+    assert.equal(firstMessages.status, 200);
+    assert.deepEqual((await firstMessages.json()).messages, []);
+
+    const reply = await fetch(
+      `${fixture.address.url}/api/sessions/${encodeURIComponent(first.id)}/messages`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: "第一条" }),
+      },
+    );
+    assert.equal(reply.status, 200);
+    assert.match(await reply.text(), /web:dynamic-1/);
+
+    const [parallelFirst, parallelSecond] = await Promise.all(
+      [first, second].map((session) =>
+        fetch(
+          `${fixture.address.url}/api/sessions/${encodeURIComponent(session.id)}/messages`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ text: "并行" }),
+          },
+        ).then((response) => response.text()),
+      ),
+    );
+    assert.match(parallelFirst, /web:dynamic-1/);
+    assert.match(parallelSecond, /web:dynamic-2/);
+    assert.equal(fixture.maximumActiveTurns, 2);
+  } finally {
+    await fixture.gateway.close();
+    await fixture.manager.close();
+  }
+});
+
+test("动态 Web Gateway 按 session 隔离审批 API", async () => {
+  const fixture = await createDynamicFixture({ approvals: true });
+  try {
+    const firstResponse = await fetch(`${fixture.address.url}/api/sessions`, {
+      method: "POST",
+    });
+    const first = ((await firstResponse.json()) as { session: SessionRecord }).session;
+    const secondResponse = await fetch(`${fixture.address.url}/api/sessions`, {
+      method: "POST",
+    });
+    const second = ((await secondResponse.json()) as { session: SessionRecord }).session;
+
+    const streamPromise = fetch(
+      `${fixture.address.url}/api/sessions/${encodeURIComponent(first.id)}/messages`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: "审批" }),
+      },
+    );
+    const pending = await waitForScopedPending(fixture.address.url, first.id);
+    assert.equal(pending.length, 1);
+    const approval = pending[0];
+    assert.ok(approval);
+
+    const hidden = await fetch(
+      `${fixture.address.url}/api/sessions/${encodeURIComponent(second.id)}/approvals/${encodeURIComponent(approval.approvalId)}`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ decision: "approve" }),
+      },
+    );
+    assert.equal(hidden.status, 404);
+
+    const resolved = await fetch(
+      `${fixture.address.url}/api/sessions/${encodeURIComponent(first.id)}/approvals/${encodeURIComponent(approval.approvalId)}`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          decision: "approve",
+          toolName: "forged",
+          argsHash: "forged",
+        }),
+      },
+    );
+    assert.equal(resolved.status, 200);
+    const stream = await (await streamPromise).text();
+    assert.match(stream, /event: approval_required/);
+    assert.match(stream, /event: approval_resolved/);
+    assert.match(stream, /审批：approved/);
+    assert.doesNotMatch(stream, /dynamic-args-hash/);
+  } finally {
+    await fixture.gateway.close();
+    await fixture.manager.close();
+    await fixture.approvalBroker.close();
+  }
+});
 
 test("Web Gateway 提供健康检查、会话和消息 SSE 接口", async () => {
   const fixture = await createFixture();
@@ -486,6 +710,23 @@ type ApprovalView = {
   requestedAt: number;
   expiresAt: number;
 };
+
+async function waitForScopedPending(
+  baseUrl: string,
+  sessionId: string,
+): Promise<ApprovalView[]> {
+  return waitFor(
+    async () => {
+      const response = await fetch(
+        `${baseUrl}/api/sessions/${encodeURIComponent(sessionId)}/approvals`,
+      );
+      assert.equal(response.status, 200);
+      const payload = (await response.json()) as { approvals: ApprovalView[] };
+      return payload.approvals;
+    },
+    (approvals) => approvals.length === 1,
+  );
+}
 
 async function waitForPending(
   baseUrl: string,
