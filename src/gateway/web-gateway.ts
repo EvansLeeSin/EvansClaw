@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 import {
   createServer,
@@ -8,10 +9,16 @@ import {
 import path from "node:path";
 import type { ChatService } from "../chat/chat-service.js";
 import type {
+  AgentManager,
+  AgentSessionHandle,
+  AgentSessionProfile,
+} from "../agent/agent-manager.js";
+import type {
   ApprovalActor,
   ApprovalBroker,
   ApprovalRequest,
 } from "../tools/approval-broker.js";
+import type { ToolPolicyIdentity } from "../tools/tool-policy.js";
 import type {
   SessionRecord,
   SessionStore,
@@ -23,10 +30,33 @@ const DEFAULT_MAX_BODY_BYTES = 64 * 1024;
 const DEFAULT_MAX_TEXT_CHARS = 16 * 1024;
 const DEFAULT_CORS_ORIGIN = "http://localhost:5173";
 
-export interface WebGatewayOptions {
-  chat: Pick<ChatService, "send" | "reset">;
-  sessionStore: Pick<SessionStore, "getOrCreate" | "load">;
+type WebChat = Pick<ChatService, "send" | "reset">;
+type WebSessionStore = Pick<
+  SessionStore,
+  "getOrCreate" | "getSession" | "listSessions" | "load"
+>;
+type GatewaySession = {
   session: SessionRecord;
+  chat: WebChat | AgentSessionHandle;
+};
+
+export interface WebGatewayOptions {
+  /** Legacy single-session wiring; omit these fields when using manager mode. */
+  chat?: WebChat;
+  session?: SessionRecord;
+  /** Shared store used for listing and resolving persisted sessions. */
+  sessionStore?: WebSessionStore;
+  /** Dynamic mode: resolves one resident AgentSessionHandle per request. */
+  manager?: AgentManager;
+  /** Fixed trusted scope used by the unauthenticated local Web entry point. */
+  channel?: string;
+  userId?: string;
+  identity?: ToolPolicyIdentity;
+  profile?: AgentSessionProfile;
+  /** Optional default for the backwards-compatible /api/approvals aliases. */
+  defaultSessionId?: string;
+  /** Server-side ID generator; clients cannot provide session IDs. */
+  createSessionId?: () => string;
   /** 运行时共享的审批 Broker；缺少时审批 API 以 503 fail-closed。 */
   approvalBroker?: ApprovalBroker;
   host?: string;
@@ -63,15 +93,24 @@ type ApprovalView = {
 };
 
 /**
- * Local-first HTTP boundary for a web UI. It deliberately exposes one
- * configured session and uses SSE for POSTed chat turns; multi-user routing,
- * authentication, and external channel adapters belong to Module 6.
+ * Local-first HTTP boundary for a web UI.
+ *
+ * Static mode keeps the original one-session API for compatibility. Dynamic
+ * mode instead uses one process-level AgentManager: every route resolves its
+ * session through the trusted Web scope before touching ChatService or Broker.
  */
 export class WebGateway {
-  private readonly chat: Pick<ChatService, "send" | "reset">;
-  private readonly sessionStore: Pick<SessionStore, "getOrCreate" | "load">;
-  private readonly session: SessionRecord;
+  private readonly chat: WebChat | undefined;
+  private readonly sessionStore: WebSessionStore;
+  private readonly session: SessionRecord | undefined;
+  private readonly manager: AgentManager | undefined;
   private readonly approvalBroker: ApprovalBroker | undefined;
+  private readonly channel: string;
+  private readonly userId: string;
+  private readonly identity: ToolPolicyIdentity;
+  private readonly profile: AgentSessionProfile;
+  private readonly defaultSessionId: string | undefined;
+  private readonly createSessionId: () => string;
   private readonly host: string;
   private readonly port: number;
   private readonly corsOrigin: string;
@@ -80,13 +119,35 @@ export class WebGateway {
   /** 前端静态目录（绝对路径）；未配置时 Gateway 只提供 API。 */
   private readonly staticDir: string | undefined;
   private server: Server | undefined;
+  /** Static mode retains the old whole-Gateway queue; manager mode queues per session. */
   private queueTail: Promise<void> = Promise.resolve();
 
   constructor(options: WebGatewayOptions) {
+    const dynamicMode = options.manager !== undefined;
+    const staticMode = options.chat !== undefined && options.session !== undefined;
+    if (dynamicMode === staticMode) {
+      throw new Error(
+        "Web Gateway 必须使用动态 AgentManager，或同时提供 chat 和 session。",
+      );
+    }
+
+    const sessionStore = options.sessionStore ?? options.manager?.sessionStore;
+    if (!sessionStore) {
+      throw new Error("Web Gateway 缺少 SessionStore。");
+    }
     this.chat = options.chat;
-    this.sessionStore = options.sessionStore;
+    this.sessionStore = sessionStore;
     this.session = options.session;
+    this.manager = options.manager;
     this.approvalBroker = options.approvalBroker;
+    this.channel = options.channel ?? options.session?.channel ?? "web";
+    this.userId = options.userId ?? options.session?.userId ?? "local";
+    this.identity = options.identity ?? { authenticated: false };
+    this.profile = options.profile ?? "read-only";
+    this.defaultSessionId =
+      options.defaultSessionId ?? options.session?.id;
+    this.createSessionId =
+      options.createSessionId ?? (() => `web:${randomUUID()}`);
     this.host = options.host ?? DEFAULT_HOST;
     this.port = positivePort(options.port ?? DEFAULT_PORT);
     this.corsOrigin = options.corsOrigin ?? DEFAULT_CORS_ORIGIN;
@@ -195,8 +256,23 @@ export class WebGateway {
       return;
     }
 
+    if (request.method === "GET" && isSamePath(segments, ["api", "sessions"])) {
+      await this.handleSessionList(response);
+      return;
+    }
+
+    if (request.method === "POST" && isSamePath(segments, ["api", "sessions"])) {
+      await this.handleSessionCreate(request, response);
+      return;
+    }
+
+    // Keep the original approval paths as aliases for the configured default
+    // session. Dynamic clients use the scoped paths below so a browser cannot
+    // accidentally resolve an approval belonging to another session.
     if (request.method === "GET" && isSamePath(segments, ["api", "approvals"])) {
-      await this.handleApprovalList(response);
+      const session = await this.resolveDefaultSession();
+      if (!session) return this.sendNotFound(response);
+      await this.handleApprovalList(response, session);
       return;
     }
 
@@ -206,13 +282,40 @@ export class WebGateway {
       segments[0] === "api" &&
       segments[1] === "approvals"
     ) {
-      await this.handleApprovalResolution(request, response, segments[2]);
+      const session = await this.resolveDefaultSession();
+      if (!session) return this.sendNotFound(response);
+      await this.handleApprovalResolution(request, response, segments[2], session);
       return;
     }
 
-    if (request.method === "GET" && isSamePath(segments, ["api", "sessions"])) {
-      const session = await this.refreshSession();
-      this.sendJson(response, 200, { sessions: [session] });
+    if (
+      request.method === "GET" &&
+      segments.length === 4 &&
+      segments[0] === "api" &&
+      segments[1] === "sessions" &&
+      segments[3] === "approvals"
+    ) {
+      const session = await this.resolveSession(segments[2]);
+      if (!session) return this.sendNotFound(response);
+      await this.handleApprovalList(response, session);
+      return;
+    }
+
+    if (
+      request.method === "POST" &&
+      segments.length === 5 &&
+      segments[0] === "api" &&
+      segments[1] === "sessions" &&
+      segments[3] === "approvals"
+    ) {
+      const session = await this.resolveSession(segments[2]);
+      if (!session) return this.sendNotFound(response);
+      await this.handleApprovalResolution(
+        request,
+        response,
+        segments[4],
+        session,
+      );
       return;
     }
 
@@ -223,13 +326,10 @@ export class WebGateway {
       segments[1] === "sessions" &&
       segments[3] === "messages"
     ) {
-      if (!this.isCurrentSession(segments[2])) {
-        this.sendNotFound(response);
-        return;
-      }
-      const session = await this.refreshSession();
-      const messages = await this.sessionStore.load(this.session.id);
-      this.sendJson(response, 200, { session, messages });
+      const session = await this.resolveSession(segments[2]);
+      if (!session) return this.sendNotFound(response);
+      const messages = await this.sessionStore.load(session.session.id);
+      this.sendJson(response, 200, { session: session.session, messages });
       return;
     }
 
@@ -240,11 +340,9 @@ export class WebGateway {
       segments[1] === "sessions" &&
       segments[3] === "messages"
     ) {
-      if (!this.isCurrentSession(segments[2])) {
-        this.sendNotFound(response);
-        return;
-      }
-      await this.handleMessage(request, response);
+      const session = await this.resolveSession(segments[2]);
+      if (!session) return this.sendNotFound(response);
+      await this.handleMessage(request, response, session);
       return;
     }
 
@@ -255,11 +353,9 @@ export class WebGateway {
       segments[1] === "sessions" &&
       segments[3] === "reset"
     ) {
-      if (!this.isCurrentSession(segments[2])) {
-        this.sendNotFound(response);
-        return;
-      }
-      await this.handleReset(response);
+      const session = await this.resolveSession(segments[2]);
+      if (!session) return this.sendNotFound(response);
+      await this.handleReset(response, session);
       return;
     }
 
@@ -319,7 +415,105 @@ export class WebGateway {
     response.end(headOnly ? undefined : body);
   }
 
-  private async handleApprovalList(response: ServerResponse): Promise<void> {
+  private async handleSessionList(response: ServerResponse): Promise<void> {
+    if (!this.manager) {
+      const session = await this.refreshStaticSession();
+      this.sendJson(response, 200, { sessions: [session] });
+      return;
+    }
+
+    // The local Web identity is a fixed scope until a real authentication
+    // adapter is introduced; never let the browser supply channel or userId.
+    const sessions = await this.sessionStore.listSessions({
+      channel: this.channel,
+      userId: this.userId,
+    });
+    this.sendJson(response, 200, { sessions });
+  }
+
+  private async handleSessionCreate(
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> {
+    if (!this.manager) {
+      this.sendNotFound(response);
+      return;
+    }
+
+    // Drain an optional request body so keep-alive connections remain usable;
+    // the server, rather than the client, chooses the new session ID.
+    await drainRequest(request, this.maxBodyBytes);
+    const session = await this.createDynamicSession();
+    this.sendJson(response, 201, { session: session.session });
+  }
+
+  private async createDynamicSession(): Promise<GatewaySession> {
+    const manager = this.manager;
+    if (!manager) throw new Error("动态 Web Gateway 未配置 AgentManager。");
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const sessionId = this.createSessionId().trim();
+      if (!isSafeSessionId(sessionId)) {
+        throw new Error("Web Gateway 生成了无效的 sessionId。");
+      }
+      if (await this.sessionStore.getSession(sessionId)) continue;
+
+      const handle = await manager.getOrCreate({
+        sessionId,
+        channel: this.channel,
+        conversationId: sessionId,
+        userId: this.userId,
+        identity: this.identity,
+        profile: this.profile,
+      });
+      return { session: handle.session, chat: handle };
+    }
+
+    throw new Error("无法分配唯一的 Web sessionId。");
+  }
+
+  private async resolveSession(sessionId: string): Promise<GatewaySession | null> {
+    if (!isSafeSessionId(sessionId)) return null;
+
+    if (!this.manager) {
+      if (!this.session || !this.chat || sessionId !== this.session.id) {
+        return null;
+      }
+      const session = await this.refreshStaticSession();
+      return { session, chat: this.chat };
+    }
+
+    const stored = await this.sessionStore.getSession(sessionId);
+    if (!stored || stored.channel !== this.channel || stored.userId !== this.userId) {
+      // Do not distinguish a foreign session from a missing session at HTTP level.
+      return null;
+    }
+
+    const handle = await this.manager.getOrCreate({
+      sessionId: stored.id,
+      channel: stored.channel,
+      conversationId: stored.conversationId,
+      userId: stored.userId,
+      identity: this.identity,
+      profile: this.profile,
+    });
+    return { session: handle.session, chat: handle };
+  }
+
+  private async resolveDefaultSession(): Promise<GatewaySession | null> {
+    const sessionId = this.defaultSessionId;
+    return sessionId ? this.resolveSession(sessionId) : null;
+  }
+
+  private async refreshStaticSession(): Promise<SessionRecord> {
+    if (!this.session) throw new Error("单会话 Web Gateway 缺少 session。");
+    return this.sessionStore.getOrCreate(this.session.id);
+  }
+
+  private async handleApprovalList(
+    response: ServerResponse,
+    session: GatewaySession,
+  ): Promise<void> {
     const broker = this.approvalBroker;
     if (!broker) {
       this.sendJson(response, 503, {
@@ -329,7 +523,7 @@ export class WebGateway {
       return;
     }
 
-    const actor = this.currentApprovalActor();
+    const actor = this.currentApprovalActor(session.session);
     const approvals = broker
       .listPending()
       .filter((request) => sameApprovalActor(request.context, actor))
@@ -341,6 +535,7 @@ export class WebGateway {
     request: IncomingMessage,
     response: ServerResponse,
     approvalId: string,
+    session: GatewaySession,
   ): Promise<void> {
     const broker = this.approvalBroker;
     if (!broker) {
@@ -352,7 +547,7 @@ export class WebGateway {
     }
 
     const pending = broker.get(approvalId);
-    const actor = this.currentApprovalActor();
+    const actor = this.currentApprovalActor(session.session);
     if (!pending || !sameApprovalActor(pending.context, actor)) {
       this.sendNotFound(response);
       return;
@@ -389,6 +584,7 @@ export class WebGateway {
   private async handleMessage(
     request: IncomingMessage,
     response: ServerResponse,
+    session: GatewaySession,
   ): Promise<void> {
     const body = await readJson(request, this.maxBodyBytes);
     const text = readText(body, this.maxTextChars);
@@ -420,9 +616,10 @@ export class WebGateway {
           response,
           activeApprovalIds,
           () => disconnected || response.writableEnded,
+          this.currentApprovalActor(session.session),
         );
         try {
-          await this.chat.send(text, (delta) => {
+          await session.chat.send(text, (delta) => {
             if (!disconnected && !response.writableEnded) {
               writeSse(response, "delta", { text: delta });
             }
@@ -434,7 +631,7 @@ export class WebGateway {
         }
       });
       if (!disconnected && !response.writableEnded) {
-        writeSse(response, "done", { sessionId: this.session.id });
+        writeSse(response, "done", { sessionId: session.session.id });
         response.end();
       }
     } catch (error) {
@@ -452,11 +649,11 @@ export class WebGateway {
     response: ServerResponse,
     activeApprovalIds: Set<string>,
     isDisconnected: () => boolean,
+    actor: ApprovalActor,
   ): () => void {
     const broker = this.approvalBroker;
     if (!broker) return () => undefined;
 
-    const actor = this.currentApprovalActor();
     return broker.subscribe((event) => {
       if (event.type === "requested") {
         if (!sameApprovalActor(event.request.context, actor)) return;
@@ -489,29 +686,28 @@ export class WebGateway {
     );
   }
 
-  private async handleReset(response: ServerResponse): Promise<void> {
-    await this.enqueue(() => this.chat.reset());
-    this.sendJson(response, 200, { ok: true, sessionId: this.session.id });
+  private async handleReset(
+    response: ServerResponse,
+    session: GatewaySession,
+  ): Promise<void> {
+    await this.enqueue(() => session.chat.reset());
+    this.sendJson(response, 200, { ok: true, sessionId: session.session.id });
   }
 
-  private async refreshSession(): Promise<SessionRecord> {
-    return this.sessionStore.getOrCreate(this.session.id);
-  }
-
-  private currentApprovalActor(): ApprovalActor {
+  private currentApprovalActor(session: SessionRecord): ApprovalActor {
     return {
-      sessionId: this.session.id,
-      conversationId: this.session.conversationId,
-      channel: this.session.channel,
-      userId: this.session.userId,
+      sessionId: session.id,
+      conversationId: session.conversationId,
+      channel: session.channel,
+      userId: session.userId,
     };
   }
 
-  private isCurrentSession(sessionId: string): boolean {
-    return sessionId === this.session.id;
-  }
-
   private enqueue<T>(operation: () => Promise<T>): Promise<T> {
+    // AgentSessionHandle already serializes by session. The legacy adapter has
+    // no manager, so retain its old whole-Gateway queue for compatibility.
+    if (this.manager) return operation();
+
     const next = this.queueTail.then(
       () => operation(),
       () => operation(),
@@ -619,6 +815,24 @@ function decodePathSegments(pathname: string): string[] | null {
   }
 }
 
+async function drainRequest(
+  request: IncomingMessage,
+  maxBytes: number,
+): Promise<void> {
+  const contentLength = Number(request.headers["content-length"] ?? 0);
+  if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+    throw new HttpRequestError(413, "请求体过大。");
+  }
+
+  let totalBytes = 0;
+  for await (const chunk of request) {
+    totalBytes += Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk);
+    if (totalBytes > maxBytes) {
+      throw new HttpRequestError(413, "请求体过大。");
+    }
+  }
+}
+
 async function readJson(
   request: IncomingMessage,
   maxBytes: number,
@@ -661,6 +875,16 @@ function readText(body: unknown, maxChars: number): string {
 
 function isJsonObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isSafeSessionId(value: string): boolean {
+  return (
+    value.length > 0 &&
+    value.length <= 256 &&
+    value !== "." &&
+    value !== ".." &&
+    !/[\\/\\0-\\x1f\\x7f]/u.test(value)
+  );
 }
 
 function writeSse(

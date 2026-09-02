@@ -69,6 +69,15 @@ export interface SessionRecord {
   messageCount: number;
 }
 
+export interface SessionListOptions {
+  /** Restrict results to one trusted channel boundary. */
+  channel?: string;
+  /** Restrict results to one trusted user boundary. */
+  userId?: string;
+  /** Maximum number of records returned, newest activity first. */
+  limit?: number;
+}
+
 export interface SessionCompactionInput {
   summary: string;
   /** 保留区第一条消息的 sequence，边界是包含式的。 */
@@ -110,6 +119,8 @@ export interface SessionStore {
     sessionId: string,
     metadata?: SessionMetadata,
   ): Promise<SessionRecord>;
+  getSession(sessionId: string): Promise<SessionRecord | null>;
+  listSessions(options?: SessionListOptions): Promise<SessionRecord[]>;
   load(sessionId: string): Promise<AgentMessage[]>;
   loadContext(sessionId: string): Promise<SessionContext>;
   getLatestCompaction(sessionId: string): Promise<SessionCompaction | null>;
@@ -132,6 +143,15 @@ type InMemorySession = {
 };
 
 const WRITE_RETRY_DELAYS_MS = [25, 50, 100, 200, 400] as const;
+const DEFAULT_SESSION_LIST_LIMIT = 100;
+const MAX_SESSION_LIST_LIMIT = 500;
+
+function clampSessionListLimit(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return DEFAULT_SESSION_LIST_LIMIT;
+  }
+  return Math.min(MAX_SESSION_LIST_LIMIT, Math.max(1, Math.ceil(value)));
+}
 
 function isBusyError(error: unknown): boolean {
   const message = error instanceof Error ? error.message.toLowerCase() : "";
@@ -246,6 +266,25 @@ export class InMemorySessionStore
     };
     this.sessions.set(sessionId, { record, messages: [], compactions: [] });
     return { ...record };
+  }
+
+  async getSession(sessionId: string): Promise<SessionRecord | null> {
+    const session = this.sessions.get(sessionId);
+    return session ? { ...session.record } : null;
+  }
+
+  async listSessions(options: SessionListOptions = {}): Promise<SessionRecord[]> {
+    const limit = clampSessionListLimit(options.limit);
+    return [...this.sessions.values()]
+      .map(({ record }) => record)
+      .filter((record) => !options.channel || record.channel === options.channel)
+      .filter((record) => !options.userId || record.userId === options.userId)
+      .sort(
+        (left, right) =>
+          right.updatedAt - left.updatedAt || right.createdAt - left.createdAt,
+      )
+      .slice(0, limit)
+      .map((record) => ({ ...record }));
   }
 
   async load(sessionId: string): Promise<AgentMessage[]> {
@@ -547,6 +586,7 @@ export class SqliteSessionStore
   private readonly database: DatabaseSync;
   private readonly approvalOwnerId = randomUUID();
   private readonly getSessionStatement: StatementSync;
+  private readonly listSessionsStatement: StatementSync;
   private readonly insertSessionStatement: StatementSync;
   private readonly updateSessionMetadataStatement: StatementSync;
   private readonly loadMessagesStatement: StatementSync;
@@ -601,6 +641,22 @@ export class SqliteSessionStore
         message_count
       FROM sessions
       WHERE id = ?
+    `);
+    this.listSessionsStatement = this.database.prepare(`
+      SELECT
+        id,
+        conversation_id,
+        channel,
+        user_id,
+        title,
+        model,
+        created_at,
+        updated_at,
+        parent_session_id,
+        message_count
+      FROM sessions
+      ORDER BY updated_at DESC, created_at DESC
+      LIMIT ?
     `);
     this.insertSessionStatement = this.database.prepare(`
       INSERT INTO sessions (
@@ -824,6 +880,22 @@ export class SqliteSessionStore
       if (!row) throw new Error(`无法创建会话 ${sessionId}。`);
       return this.toSessionRecord(row);
     });
+  }
+
+  async getSession(sessionId: string): Promise<SessionRecord | null> {
+    const row = this.getSessionStatement.get(sessionId) as
+      | SessionRow
+      | undefined;
+    return row ? this.toSessionRecord(row) : null;
+  }
+
+  async listSessions(options: SessionListOptions = {}): Promise<SessionRecord[]> {
+    const limit = clampSessionListLimit(options.limit);
+    const rows = this.listSessionsStatement.all(limit) as unknown as SessionRow[];
+    return rows
+      .filter((row) => !options.channel || row.channel === options.channel)
+      .filter((row) => !options.userId || row.user_id === options.userId)
+      .map((row) => this.toSessionRecord(row));
   }
 
   async load(sessionId: string): Promise<AgentMessage[]> {

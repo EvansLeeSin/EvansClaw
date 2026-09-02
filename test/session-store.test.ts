@@ -92,6 +92,49 @@ test("initializes the structured schema and records migration version", () => {
   }
 });
 
+test("会话存储可以按渠道和用户列出会话，并读取单个会话", async () => {
+  const fixture = createDatabaseFixture();
+  const sqlite = new SqliteSessionStore(fixture.path);
+  const stores = [new InMemorySessionStore(), sqlite];
+  try {
+    for (const store of stores) {
+      await store.getOrCreate("web-alice", {
+        conversationId: "conversation-a",
+        channel: "web",
+        userId: "alice",
+      });
+      await store.getOrCreate("web-bob", {
+        conversationId: "conversation-b",
+        channel: "web",
+        userId: "bob",
+      });
+      await store.getOrCreate("cli-alice", {
+        conversationId: "conversation-c",
+        channel: "cli",
+        userId: "alice",
+      });
+
+      assert.equal((await store.getSession("web-alice"))?.conversationId, "conversation-a");
+      assert.equal(await store.getSession("missing"), null);
+      assert.deepEqual(
+        (await store.listSessions({ channel: "web", userId: "alice" })).map(
+          (session) => session.id,
+        ),
+        ["web-alice"],
+      );
+      assert.deepEqual(
+        (await store.listSessions({ userId: "alice" })).map(
+          (session) => session.id,
+        ).sort(),
+        ["cli-alice", "web-alice"],
+      );
+    }
+  } finally {
+    sqlite.close();
+    fixture.cleanup();
+  }
+});
+
 test("将已有 schema v2 数据库升级到 schema v4", () => {
   const fixture = createDatabaseFixture();
   try {
