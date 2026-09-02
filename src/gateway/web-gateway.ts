@@ -10,7 +10,6 @@ import path from "node:path";
 import type { ChatService } from "../chat/chat-service.js";
 import type {
   AgentManager,
-  AgentSessionHandle,
   AgentSessionProfile,
 } from "../agent/agent-manager.js";
 import type {
@@ -37,7 +36,8 @@ type WebSessionStore = Pick<
 >;
 type GatewaySession = {
   session: SessionRecord;
-  chat: WebChat | AgentSessionHandle;
+  chat: WebChat;
+  run<T>(operation: (chat: WebChat) => Promise<T>): Promise<T>;
 };
 
 export interface WebGatewayOptions {
@@ -466,7 +466,11 @@ export class WebGateway {
         identity: this.identity,
         profile: this.profile,
       });
-      return { session: handle.session, chat: handle };
+      return {
+        session: handle.session,
+        chat: handle,
+        run: (operation) => handle.run(operation),
+      };
     }
 
     throw new Error("无法分配唯一的 Web sessionId。");
@@ -480,7 +484,11 @@ export class WebGateway {
         return null;
       }
       const session = await this.refreshStaticSession();
-      return { session, chat: this.chat };
+      return {
+        session,
+        chat: this.chat,
+        run: (operation) => this.enqueue(() => operation(this.chat!)),
+      };
     }
 
     const stored = await this.sessionStore.getSession(sessionId);
@@ -497,7 +505,11 @@ export class WebGateway {
       identity: this.identity,
       profile: this.profile,
     });
-    return { session: handle.session, chat: handle };
+    return {
+      session: handle.session,
+      chat: handle,
+      run: (operation) => handle.run(operation),
+    };
   }
 
   private async resolveDefaultSession(): Promise<GatewaySession | null> {
@@ -611,7 +623,10 @@ export class WebGateway {
     });
 
     try {
-      await this.enqueue(async () => {
+      // Static mode maps run() to the legacy Gateway-wide queue. Dynamic mode
+      // delegates it to AgentManager, so different sessions can stream in
+      // parallel while approval subscriptions remain paired with one turn.
+      await session.run(async (chat) => {
         const unsubscribe = this.subscribeApprovalEvents(
           response,
           activeApprovalIds,
@@ -619,7 +634,7 @@ export class WebGateway {
           this.currentApprovalActor(session.session),
         );
         try {
-          await session.chat.send(text, (delta) => {
+          await chat.send(text, (delta) => {
             if (!disconnected && !response.writableEnded) {
               writeSse(response, "delta", { text: delta });
             }
@@ -690,7 +705,7 @@ export class WebGateway {
     response: ServerResponse,
     session: GatewaySession,
   ): Promise<void> {
-    await this.enqueue(() => session.chat.reset());
+    await session.run((chat) => chat.reset());
     this.sendJson(response, 200, { ok: true, sessionId: session.session.id });
   }
 

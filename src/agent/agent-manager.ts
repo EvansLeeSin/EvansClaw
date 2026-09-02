@@ -47,10 +47,16 @@ export type AgentSessionFactory = (
   session: SessionRecord,
 ) => AgentSessionRuntime | Promise<AgentSessionRuntime>;
 
+export type AgentSessionOperation<T> = (
+  chat: Pick<ChatService, "send" | "reset">,
+) => Promise<T>;
+
 export interface AgentSessionHandle {
   readonly session: SessionRecord;
   readonly descriptor: Required<AgentSessionDescriptor>;
   readonly toolRegistry?: ToolRegistry;
+  /** Run a callback inside this session's queue without exposing its Agent. */
+  run<T>(operation: AgentSessionOperation<T>): Promise<T>;
   send(text: string, onTextDelta: TextDeltaHandler): Promise<void>;
   reset(): Promise<void>;
   abort(): void;
@@ -219,13 +225,19 @@ export class AgentManager {
   }
 
   private createHandle(entry: SessionEntry): AgentSessionHandle {
+    // Gateway adapters use run() when they need per-turn bookkeeping (for
+    // example, subscribing to approval events) to start at the same time as
+    // ChatService. The callback receives only the chat surface, never Agent.
+    const run = <T>(operation: AgentSessionOperation<T>): Promise<T> =>
+      this.enqueue(entry, () => operation(entry.runtime.chat));
     return {
       session: entry.session,
       descriptor: entry.descriptor,
       toolRegistry: entry.runtime.toolRegistry,
+      run,
       send: (text, onTextDelta) =>
-        this.enqueue(entry, () => entry.runtime.chat.send(text, onTextDelta)),
-      reset: () => this.enqueue(entry, () => entry.runtime.chat.reset()),
+        run((chat) => chat.send(text, onTextDelta)),
+      reset: () => run((chat) => chat.reset()),
       abort: () => entry.runtime.agent.abort(),
     };
   }
