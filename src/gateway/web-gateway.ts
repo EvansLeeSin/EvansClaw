@@ -121,6 +121,8 @@ export class WebGateway {
   private server: Server | undefined;
   /** Static mode retains the old whole-Gateway queue; manager mode queues per session. */
   private queueTail: Promise<void> = Promise.resolve();
+  /** Serialize server-side ID allocation so injected generators cannot collide. */
+  private sessionCreationTail: Promise<void> = Promise.resolve();
 
   constructor(options: WebGatewayOptions) {
     const dynamicMode = options.manager !== undefined;
@@ -447,7 +449,19 @@ export class WebGateway {
     this.sendJson(response, 201, { session: session.session });
   }
 
-  private async createDynamicSession(): Promise<GatewaySession> {
+  private createDynamicSession(): Promise<GatewaySession> {
+    const next = this.sessionCreationTail.then(
+      () => this.createDynamicSessionInternal(),
+      () => this.createDynamicSessionInternal(),
+    );
+    this.sessionCreationTail = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    return next;
+  }
+
+  private async createDynamicSessionInternal(): Promise<GatewaySession> {
     const manager = this.manager;
     if (!manager) throw new Error("动态 Web Gateway 未配置 AgentManager。");
 
