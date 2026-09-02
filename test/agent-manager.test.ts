@@ -214,6 +214,7 @@ test("AgentManager 关闭后拒绝新会话和新操作，并只关闭共享资�
     AgentManagerClosedError,
   );
   await assert.rejects(handle.send("after close", () => undefined), AgentManagerClosedError);
+  await assert.rejects(handle.run(async () => undefined), AgentManagerClosedError);
 });
 
 function fakeRuntime(): AgentSessionRuntime {

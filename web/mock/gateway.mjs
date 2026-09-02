@@ -18,6 +18,7 @@ const SESSION_ID = "web:local:personal";
 const now = Date.now();
 let clock = now;
 let approvalCounter = 0;
+let sessionCounter = 0;
 const approvals = new Map();
 
 function ts() {
@@ -95,6 +96,8 @@ const history = [
   },
 ];
 
+const sessions = new Map([[SESSION_ID, history]]);
+
 const replyChunks = [
   "收到！这是 mock 网关的**流式回复**，",
   "用来验证 SSE 增量渲染。\n\n",
@@ -123,10 +126,20 @@ const server = createServer((request, response) => {
     segments.length === 2 &&
     segments[0] === "api" &&
     segments[1] === "approvals";
+  const isScopedApprovalsRoute =
+    segments.length === 4 &&
+    segments[0] === "api" &&
+    segments[1] === "sessions" &&
+    segments[3] === "approvals";
   const isApprovalResolutionRoute =
     segments.length === 3 &&
     segments[0] === "api" &&
     segments[1] === "approvals";
+  const isScopedApprovalResolutionRoute =
+    segments.length === 5 &&
+    segments[0] === "api" &&
+    segments[1] === "sessions" &&
+    segments[3] === "approvals";
   response.setHeader("Access-Control-Allow-Origin", "*");
   response.setHeader("Access-Control-Allow-Headers", "Content-Type");
   response.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -149,20 +162,44 @@ const server = createServer((request, response) => {
   }
 
   if (request.method === "GET" && url.pathname === "/api/sessions") {
-    return sendJson(200, { sessions: [sessionRecord()] });
+    return sendJson(200, {
+      sessions: [...sessions.keys()].map((sessionId) => sessionRecord(sessionId)),
+    });
   }
 
-  if (request.method === "GET" && isApprovalsRoute) {
+  if (request.method === "POST" && url.pathname === "/api/sessions") {
+    const sessionId = `web:mock:${++sessionCounter}`;
+    sessions.set(sessionId, []);
+    return sendJson(201, { session: sessionRecord(sessionId) });
+  }
+
+  if (request.method === "GET" && (isApprovalsRoute || isScopedApprovalsRoute)) {
+    const sessionId = isScopedApprovalsRoute ? segments[2] : undefined;
+    if (sessionId && !sessions.has(sessionId)) {
+      return sendJson(404, { error: "not_found", message: "请求资源不存在。" });
+    }
     return sendJson(200, {
-      approvals: [...approvals.values()].map(({ approval }) => approval),
+      approvals: [...approvals.values()]
+        .filter(({ sessionId: pendingSessionId }) => !sessionId || pendingSessionId === sessionId)
+        .map(({ approval }) => approval),
     });
   }
 
   if (request.method === "GET" && isMessagesRoute) {
-    return sendJson(200, { session: sessionRecord(), messages: history });
+    const sessionId = segments[2];
+    const sessionHistory = sessions.get(sessionId);
+    if (!sessionHistory) {
+      return sendJson(404, { error: "not_found", message: "请求资源不存在。" });
+    }
+    return sendJson(200, { session: sessionRecord(sessionId), messages: sessionHistory });
   }
 
-  if (request.method === "POST" && isApprovalResolutionRoute) {
+  if (
+    request.method === "POST" &&
+    (isApprovalResolutionRoute || isScopedApprovalResolutionRoute)
+  ) {
+    const routeSessionId = isScopedApprovalResolutionRoute ? segments[2] : undefined;
+    const approvalId = isScopedApprovalResolutionRoute ? segments[4] : segments[2];
     let body = "";
     request.on("data", (chunk) => (body += chunk));
     request.on("end", () => {
@@ -181,14 +218,17 @@ const server = createServer((request, response) => {
           message: "审批决策无效。",
         });
       }
-      const pending = approvals.get(segments[2]);
-      if (!pending) {
+      const pending = approvals.get(approvalId);
+      if (
+        !pending ||
+        (routeSessionId && pending.sessionId !== routeSessionId)
+      ) {
         return sendJson(404, {
           error: "not_found",
           message: "审批请求不存在。",
         });
       }
-      approvals.delete(segments[2]);
+      approvals.delete(approvalId);
       const outcome = decision === "approve" ? "approved" : "denied";
       pending.response.write(
         `event: approval_resolved\ndata: ${JSON.stringify({
@@ -201,7 +241,7 @@ const server = createServer((request, response) => {
         decision === "approve"
           ? "审批已通过，工具操作完成。"
           : "审批已拒绝，工具没有执行。";
-      history.push({
+      sessions.get(pending.sessionId)?.push({
         role: "assistant",
         content: [{ type: "text", text: reply }],
         model: "deepseek-v4-flash",
@@ -212,7 +252,7 @@ const server = createServer((request, response) => {
         `event: delta\ndata: ${JSON.stringify({ text: reply })}\n\n`,
       );
       pending.response.write(
-        `event: done\ndata: ${JSON.stringify({ sessionId: SESSION_ID })}\n\n`,
+        `event: done\ndata: ${JSON.stringify({ sessionId: pending.sessionId })}\n\n`,
       );
       pending.response.end();
       sendJson(200, { ok: true, approvalId: pending.approval.approvalId });
@@ -221,11 +261,16 @@ const server = createServer((request, response) => {
   }
 
   if (request.method === "POST" && isMessagesRoute) {
+    const sessionId = segments[2];
+    const sessionHistory = sessions.get(sessionId);
+    if (!sessionHistory) {
+      return sendJson(404, { error: "not_found", message: "请求资源不存在。" });
+    }
     let body = "";
     request.on("data", (chunk) => (body += chunk));
     request.on("end", () => {
       const text = JSON.parse(body || "{}").text ?? "";
-      history.push({ role: "user", content: text, timestamp: ts() });
+      sessionHistory.push({ role: "user", content: text, timestamp: ts() });
       response.writeHead(200, {
         "Content-Type": "text/event-stream; charset=utf-8",
         "Cache-Control": "no-cache",
@@ -256,7 +301,7 @@ const server = createServer((request, response) => {
           requestedAt: Date.now(),
           expiresAt: Date.now() + 60_000,
         };
-        const pending = { approval, response };
+        const pending = { approval, response, sessionId };
         approvals.set(approval.approvalId, pending);
         response.on("close", () => {
           if (approvals.get(approval.approvalId) === pending) {
@@ -278,14 +323,14 @@ const server = createServer((request, response) => {
           return;
         }
         clearInterval(timer);
-        history.push({
+        sessionHistory.push({
           role: "assistant",
           content: [{ type: "text", text: replyChunks.join("") }],
           model: "deepseek-v4-flash",
           stopReason: "stop",
           timestamp: ts(),
         });
-        response.write(`event: done\ndata: ${JSON.stringify({ sessionId: SESSION_ID })}\n\n`);
+        response.write(`event: done\ndata: ${JSON.stringify({ sessionId })}\n\n`);
         response.end();
       }, 120);
     });
@@ -293,30 +338,36 @@ const server = createServer((request, response) => {
   }
 
   if (request.method === "POST" && isResetRoute) {
-    for (const { response: pendingResponse } of approvals.values()) {
-      pendingResponse.end();
+    const sessionId = segments[2];
+    const sessionHistory = sessions.get(sessionId);
+    if (!sessionHistory) {
+      return sendJson(404, { error: "not_found", message: "请求资源不存在。" });
     }
-    approvals.clear();
-    history.length = 0;
+    for (const [approvalId, pending] of approvals) {
+      if (pending.sessionId !== sessionId) continue;
+      pending.response.end();
+      approvals.delete(approvalId);
+    }
+    sessionHistory.length = 0;
     clock = now;
-    return sendJson(200, { ok: true, sessionId: SESSION_ID });
+    return sendJson(200, { ok: true, sessionId });
   }
-
   sendJson(404, { error: "not_found", message: "请求资源不存在。" });
 });
 
-function sessionRecord() {
+function sessionRecord(sessionId = SESSION_ID) {
+  const sessionHistory = sessions.get(sessionId) ?? [];
   return {
-    id: SESSION_ID,
-    conversationId: SESSION_ID,
+    id: sessionId,
+    conversationId: sessionId,
     channel: "web",
     userId: "local",
-    title: "EvansClaw Mock 会话",
+    title: sessionId === SESSION_ID ? "EvansClaw Mock 会话" : null,
     model: "deepseek-v4-flash",
     createdAt: now,
     updatedAt: clock,
     parentSessionId: null,
-    messageCount: history.length,
+    messageCount: sessionHistory.length,
   };
 }
 

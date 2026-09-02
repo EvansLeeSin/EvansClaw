@@ -74,7 +74,7 @@ CLI / Telegram / 飞书 / Web / Cron
 | 3 | Skills 按需加载 | Prompt 构造、文件读取 | 中 | 已完成基础实现 |
 | 4 | Tool Registry | Agent Tool API、TypeBox、SessionStore | 高 | 已完成基础实现 |
 | 5 | Tool Policy 和人工确认 | Tool Registry、身份上下文 | 高 | Policy、Broker、Web 审批和受隔离的 `write_file` 已完成 |
-| 6 | Channel Gateway | AgentManager、Policy | 高 | AgentManager 核心已完成，Web 基础 Gateway 单会话，外部渠道待实现 |
+| 6 | Channel Gateway | AgentManager、Policy | 高 | AgentManager 与 Web 动态多会话 Gateway 已完成，外部渠道待实现 |
 | 7 | Cron 定时任务 | Gateway、会话/任务存储 | 中 | 待实现 |
 | 8 | 长期记忆和用户画像 | SQLite、检索、Policy | 中 | 待实现 |
 
@@ -536,14 +536,14 @@ D1–D9-C 已完成：Policy、Approval Broker、SQLite 审批持久化、ToolRe
 
 - `write_file` 目前只在 Web Runtime 注册，CLI 尚未提供终端审批交互。
 - 尚未接入 Shell、消息发送或外部 API 工具。
-- Web Gateway 仍是本机单会话、无认证入口，只适合本机或受信任开发环境。
+- Web Gateway 仍是本机无认证入口，只适合本机或受信任开发环境；动态会话范围固定在当前 Web 身份。
 - 当前写文件审批/审计按配置保留完整参数，数据库尚无加密和自动清理策略。
 
 ---
 
 ## 9. 模块六：Channel Gateway
 
-### 当前状态：AgentManager 与轻量 Web Gateway 已完成，完整 Channel Gateway 待实现
+### 当前状态：AgentManager 与 Web 动态多会话 Gateway 已完成，完整 Channel Gateway 待实现
 
 当前已新增：
 
@@ -554,12 +554,14 @@ D1–D9-C 已完成：Policy、Approval Broker、SQLite 审批持久化、ToolRe
 - `src/web-main.ts`：独立 Web Gateway 启动入口；
 - `src/app/chat-runtime.ts`：CLI 与 Web 共用的 Agent/Skill/Tool/Session 组装边界；
 - `GET /api/health`；
-- `GET /api/sessions`；
+- `GET /api/sessions`：列出当前 Web 身份可见的会话；
+- `POST /api/sessions`：创建由服务端生成 ID 的新会话；
 - `GET /api/sessions/:id/messages`；
 - `POST /api/sessions/:id/messages`：JSON 请求，SSE 流式返回 `delta`、`done`、`error`、`approval_required` 或 `approval_resolved` 事件；
-- `GET /api/approvals`：查询当前会话的脱敏 pending 审批；
-- `POST /api/approvals/:approvalId`：只提交 `approve`/`deny` 决策，绑定字段由服务端恢复；
+- `GET /api/sessions/:id/approvals`：查询指定会话的脱敏 pending 审批；
+- `POST /api/sessions/:id/approvals/:approvalId`：只提交 `approve`/`deny` 决策，绑定字段由服务端恢复；
 - `POST /api/sessions/:id/reset`；
+- `/api/approvals` 和 `/api/approvals/:approvalId` 仍保留为默认会话兼容别名；
 - Web Runtime 默认注册受审批保护的 `write_file`，工作区由 `EVANSCLAW_WORKSPACE_DIR` 或 `data/workspace` 决定；
 - CORS、请求体大小限制、输入校验和同一会话串行队列；
 - 同源静态托管：非 `/api` 的 GET/HEAD 请求从 `web/dist` 返回，支持 MIME、Vite `assets/` 长缓存、SPA `index.html` 回退和路径穿越防护。
@@ -572,7 +574,7 @@ npm run web
 
 `npm run web` 的 `preweb` 生命周期会先执行 `build:ui`，因此一个命令即可构建前端并启动完整应用；浏览器直接访问 `http://127.0.0.1:8787`。缺少 `web/dist` 时 `dev:web` 仍可退化为纯 API 模式。默认静态目录可用 `EVANSCLAW_WEB_STATIC_DIR` 覆盖，显式目录无效时启动失败。
 
-默认监听 `127.0.0.1:8787`，可通过 `EVANSCLAW_WEB_HOST`、`EVANSCLAW_WEB_PORT`、`EVANSCLAW_WEB_CORS_ORIGIN` 和 `EVANSCLAW_WEB_SESSION_ID` 配置。当前 Gateway 没有认证，只适合本机或受信任的开发环境；它只暴露一个配置好的 Web 会话，不支持多用户、多会话动态创建和外部平台适配。多会话能力由进程级 AgentManager 提供，动态 Web 路由仍待实现。
+默认监听 `127.0.0.1:8787`，可通过 `EVANSCLAW_WEB_HOST`、`EVANSCLAW_WEB_PORT`、`EVANSCLAW_WEB_CORS_ORIGIN` 和 `EVANSCLAW_WEB_SESSION_ID` 配置。当前 Gateway 没有认证，只适合本机或受信任的开发环境；Web 入口固定使用本机 Web 身份，支持创建、列出和切换多个独立会话。多会话由进程级 AgentManager 管理；多用户认证和外部平台适配仍待实现。
 
 ### 当前状态：Web 前端（web/）已完成基础聊天界面
 
@@ -588,7 +590,7 @@ npm run web
   - 审批卡片：展示风险、确认级别和脱敏参数，支持一次性允许/拒绝，终态由 SSE 与服务端重同步共同确认；
 - `web/vite.config.ts`：开发期 `/api` 代理到 `127.0.0.1:8787`，无需 CORS；
 - `web/mock/gateway.mjs`：无需 DeepSeek API Key 的 mock Gateway（覆盖全部渲染分支、审批 API 和 SSE 流式回复）；
-- `web/mock/smoke.mjs`：puppeteer-core 驱动本机 Edge 的无头冒烟测试，覆盖批准/拒绝和参数脱敏。
+- `web/mock/smoke.mjs`：puppeteer-core 驱动本机 Edge 的无头冒烟测试，覆盖会话创建/切换、批准/拒绝和参数脱敏。
 
 运行、开发与验证：
 

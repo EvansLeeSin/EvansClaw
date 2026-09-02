@@ -8,7 +8,7 @@
 - `deepseek-v4-flash` 和 `deepseek-v4-pro` 模型
 - CLI 交互式聊天
 - 流式输出
-- 进程内多个独立会话的 `AgentManager`（CLI/Web 兼容入口当前默认单会话）
+- 进程内多个独立会话的 `AgentManager`（CLI 保留单会话兼容入口，Web 支持动态多会话）
 - 基于 `sessions` / `messages` 的结构化 SQLite 会话持久化
 - 按轮次批量追加消息，保留完整 `AgentMessage` JSON
 - FTS5 全文搜索、中文 trigram 搜索与 LIKE 兜底
@@ -94,12 +94,15 @@ Gateway 提供以下接口：
 
 ```text
 GET  /api/health
-GET  /api/sessions
+GET  /api/sessions                       # 当前 Web 身份可见的会话
+POST /api/sessions                      # 创建会话，ID 由服务端生成
 GET  /api/sessions/:id/messages
-POST /api/sessions/:id/messages   # {"text":"..."}，SSE 流式响应
-GET  /api/approvals              # 当前会话的脱敏 pending 审批
-POST /api/approvals/:approvalId  # {"decision":"approve"|"deny"}
+POST /api/sessions/:id/messages         # {"text":"..."}，SSE 流式响应
+GET  /api/sessions/:id/approvals        # 当前会话的脱敏 pending 审批
+POST /api/sessions/:id/approvals/:approvalId # {"decision":"approve"|"deny"}
 POST /api/sessions/:id/reset
+
+# /api/approvals 和 /api/approvals/:approvalId 仍作为默认会话兼容别名
 ```
 
 ### 前端开发模式
@@ -113,7 +116,7 @@ npm run dev:ui      # 终端 2：Vite http://localhost:5173，/api 代理到 878
 
 无 API Key 时可用 mock Gateway 联调：`cd web && npm run mock`，并用 `npm run smoke` 跑无头浏览器冒烟测试。审批中的写入/外部操作会通过 SSE 推送审批卡片，浏览器只提交批准或拒绝决策。
 
-默认 Web 会话为 `web:local:personal`，与 CLI 的 `personal` 会话分开。可通过 `EVANSCLAW_WEB_HOST`、`EVANSCLAW_WEB_PORT`、`EVANSCLAW_WEB_CORS_ORIGIN` 和 `EVANSCLAW_WEB_SESSION_ID` 配置。`EVANSCLAW_WEB_STATIC_DIR` 可覆盖默认的 `web/dist` 静态目录；显式目录无效时启动会失败并给出错误。Web 的 `write_file` 默认工作区为 `data/workspace`，可通过 `EVANSCLAW_WORKSPACE_DIR` 配置。Gateway 默认只监听本机且没有认证，不应直接暴露到公网。
+默认 Web 会话为 `web:local:personal`，与 CLI 的 `personal` 会话分开；它会作为首次打开 Web 时的历史会话，之后可以在页面中创建和切换多个独立会话。可通过 `EVANSCLAW_WEB_HOST`、`EVANSCLAW_WEB_PORT`、`EVANSCLAW_WEB_CORS_ORIGIN` 和 `EVANSCLAW_WEB_SESSION_ID` 配置。`EVANSCLAW_WEB_STATIC_DIR` 可覆盖默认的 `web/dist` 静态目录；显式目录无效时启动会失败并给出错误。Web 的 `write_file` 默认工作区为 `data/workspace`，可通过 `EVANSCLAW_WORKSPACE_DIR` 配置。Gateway 默认只监听本机且没有认证，不应直接暴露到公网。
 
 ## Skills
 

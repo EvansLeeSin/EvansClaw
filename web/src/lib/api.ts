@@ -3,10 +3,11 @@
  *
  * 对接的 API 面（src/gateway/web-gateway.ts）：
  * - GET  /api/sessions                     → { sessions: SessionRecord[] }
+ * - POST /api/sessions                    → { session: SessionRecord }
  * - GET  /api/sessions/:id/messages        → { session, messages }
  * - POST /api/sessions/:id/messages        → SSE 流（delta / done / error / approval_* 事件）
- * - GET  /api/approvals                     → { approvals: ApprovalRequestView[] }
- * - POST /api/approvals/:id                 → { ok, approvalId }
+ * - GET  /api/sessions/:id/approvals       → { approvals: ApprovalRequestView[] }
+ * - POST /api/sessions/:id/approvals/:id   → { ok, approvalId }
  * - POST /api/sessions/:id/reset           → { ok, sessionId }
  *
  * 开发环境下 Vite 把 /api 代理到 127.0.0.1:8787（见 vite.config.ts），
@@ -30,10 +31,30 @@ export class GatewayError extends Error {
   }
 }
 
-/** 拉取当前配置的会话（Gateway 只暴露一个会话）。 */
-export async function fetchSession(): Promise<SessionRecord> {
+/** 拉取当前 Web 身份可见的全部会话。 */
+export async function fetchSessions(): Promise<SessionRecord[]> {
   const data = await getJson<{ sessions: SessionRecord[] }>("/api/sessions");
-  const session = data.sessions[0];
+  if (!Array.isArray(data.sessions)) {
+    throw new GatewayError(500, "Gateway 返回了无效的会话列表。");
+  }
+  return data.sessions;
+}
+
+/**
+ * 创建会话。sessionId 由 Gateway 服务端生成，客户端不能指定或覆盖已有会话。
+ */
+export async function createSession(): Promise<SessionRecord> {
+  const data = await postJson<{ session?: SessionRecord }>("/api/sessions", {});
+  if (!data.session || typeof data.session.id !== "string") {
+    throw new GatewayError(500, "Gateway 未返回有效的新会话。");
+  }
+  return data.session;
+}
+
+/** 兼容单会话入口：返回可见列表中的第一个会话。 */
+export async function fetchSession(): Promise<SessionRecord> {
+  const sessions = await fetchSessions();
+  const session = sessions[0];
   if (!session) throw new GatewayError(404, "Gateway 未返回可用会话。");
   return session;
 }
@@ -48,11 +69,14 @@ export async function fetchMessages(
   return data.messages;
 }
 
-/** 拉取当前会话仍在等待的审批请求。 */
-export async function fetchApprovals(): Promise<ApprovalRequestView[]> {
-  const data = await getJson<{ approvals: ApprovalRequestView[] }>(
-    "/api/approvals",
-  );
+/** 拉取指定会话仍在等待的审批请求。 */
+export async function fetchApprovals(
+  sessionId?: string,
+): Promise<ApprovalRequestView[]> {
+  const url = sessionId
+    ? `/api/sessions/${encodeURIComponent(sessionId)}/approvals`
+    : "/api/approvals";
+  const data = await getJson<{ approvals: ApprovalRequestView[] }>(url);
   if (!Array.isArray(data.approvals) || !data.approvals.every(isApprovalRequestView)) {
     throw new GatewayError(500, "Gateway 返回了无效的审批列表。");
   }
@@ -63,8 +87,12 @@ export async function fetchApprovals(): Promise<ApprovalRequestView[]> {
 export async function resolveApproval(
   approvalId: string,
   decision: "approve" | "deny",
+  sessionId?: string,
 ): Promise<void> {
-  await postJson(`/api/approvals/${encodeURIComponent(approvalId)}`, {
+  const url = sessionId
+    ? `/api/sessions/${encodeURIComponent(sessionId)}/approvals/${encodeURIComponent(approvalId)}`
+    : `/api/approvals/${encodeURIComponent(approvalId)}`;
+  await postJson(url, {
     decision,
   });
 }

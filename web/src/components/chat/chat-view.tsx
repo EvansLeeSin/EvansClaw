@@ -11,6 +11,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   CircleAlertIcon,
+  PlusIcon,
   RotateCcwIcon,
   SendIcon,
   SparklesIcon,
@@ -33,9 +34,10 @@ import {
 } from "@/components/chat/approval-card";
 import { Markdown } from "@/components/chat/markdown";
 import {
+  createSession,
   fetchApprovals,
   fetchMessages,
-  fetchSession,
+  fetchSessions,
   GatewayError,
   resetSession,
   resolveApproval,
@@ -58,6 +60,8 @@ interface ApprovalCardState {
 }
 
 export function ChatView() {
+  const [sessions, setSessions] = useState<SessionRecord[]>([]);
+  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [session, setSession] = useState<SessionRecord | null>(null);
   const [messages, setMessages] = useState<AgentMessage[]>([]);
   const [approvals, setApprovals] = useState<ApprovalCardState[]>([]);
@@ -69,6 +73,7 @@ export function ChatView() {
   const resetTimer = useRef<ReturnType<typeof setTimeout> | undefined>(
     undefined,
   );
+  const reloadVersion = useRef(0);
 
   /**
    * 拉取会话元数据 + 完整消息列表。
@@ -77,14 +82,28 @@ export function ChatView() {
    */
   const reload = useCallback(
     async (options?: { preserveError?: boolean }): Promise<void> => {
-      let currentSession: SessionRecord;
+      const version = ++reloadVersion.current;
       try {
-        // 会话元数据先落地：即使历史拉取失败，头部也能正确展示并允许重试。
-        currentSession = await fetchSession();
+        let availableSessions = await fetchSessions();
+        // 没有历史会话时由服务端生成第一个会话，避免客户端自行拼接 ID。
+        if (availableSessions.length === 0) {
+          availableSessions = [await createSession()];
+        }
+        if (version !== reloadVersion.current) return;
+
+        setSessions(availableSessions);
+        const currentSession =
+          availableSessions.find((item) => item.id === selectedSessionId) ??
+          availableSessions[0];
+        if (!currentSession) throw new GatewayError(404, "Gateway 未返回可用会话。");
+        setSelectedSessionId(currentSession.id);
         setSession(currentSession);
+
         const history = await fetchMessages(currentSession.id);
+        if (version !== reloadVersion.current) return;
         setMessages(history);
-        const pendingApprovals = await fetchApprovals();
+        const pendingApprovals = await fetchApprovals(currentSession.id);
+        if (version !== reloadVersion.current) return;
         setApprovals(
           pendingApprovals.map((approval) => ({
             approval,
@@ -94,6 +113,7 @@ export function ChatView() {
         );
         if (!options?.preserveError) setLoadError(null);
       } catch (error) {
+        if (version !== reloadVersion.current) return;
         setLoadError(
           error instanceof GatewayError
             ? `无法连接 EvansClaw Gateway：${error.message}`
@@ -101,7 +121,7 @@ export function ChatView() {
         );
       }
     },
-    [],
+    [selectedSessionId],
   );
 
   useEffect(() => {
@@ -155,11 +175,43 @@ export function ChatView() {
     [],
   );
 
+  const handleSelectSession = useCallback(
+    (sessionId: string): void => {
+      if (!sessionId || sessionId === selectedSessionId || sending) return;
+      setSelectedSessionId(sessionId);
+      setSession(null);
+      setMessages([]);
+      setApprovals([]);
+      setStreamingText(null);
+      setLoadError(null);
+    },
+    [selectedSessionId, sending],
+  );
+
+  const handleCreateSession = useCallback(async (): Promise<void> => {
+    if (sending) return;
+    try {
+      const created = await createSession();
+      setSessions((previous) => [created, ...previous.filter((item) => item.id !== created.id)]);
+      setSelectedSessionId(created.id);
+      setSession(null);
+      setMessages([]);
+      setApprovals([]);
+      setStreamingText(null);
+      setLoadError(null);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      setLoadError(`创建会话失败：${detail}`);
+    }
+  }, [sending]);
+
   const handleApprovalResolve = useCallback(
     async (
       approvalId: string,
       decision: "approve" | "deny",
     ): Promise<void> => {
+      const approvalSessionId = session?.id;
+      if (!approvalSessionId) return;
       setApprovals((previous) =>
         previous.map((item) =>
           item.approval.approvalId === approvalId
@@ -168,7 +220,7 @@ export function ChatView() {
         ),
       );
       try {
-        await resolveApproval(approvalId, decision);
+        await resolveApproval(approvalId, decision, approvalSessionId);
         // SSE 通常会随后提供准确终态；这里先解除 loading，避免断开流时
         // 卡片永远显示处理中。若收到 SSE，事件状态会再次覆盖这里的值。
         setApprovals((previous) =>
@@ -195,7 +247,7 @@ export function ChatView() {
         setLoadError(`审批请求失败：${detail}`);
       }
     },
-    [],
+    [session?.id],
   );
 
   const handleSend = useCallback(async (): Promise<void> => {
@@ -284,12 +336,35 @@ export function ChatView() {
               : "正在连接…"}
           </p>
         </div>
-        <div className="ml-auto flex items-center gap-2">
+        <div className="ml-auto flex min-w-0 items-center gap-2">
           {session && (
-            <span className="text-xs text-muted-foreground">
+            <span className="hidden text-xs text-muted-foreground sm:inline">
               {session.messageCount} 条消息
             </span>
           )}
+          <select
+            aria-label="选择会话"
+            value={selectedSessionId ?? ""}
+            onChange={(event) => handleSelectSession(event.target.value)}
+            disabled={sending || sessions.length === 0}
+            className="max-w-36 rounded-md border bg-background px-2 py-1 text-xs outline-none focus:ring-2 focus:ring-ring sm:max-w-52"
+          >
+            {sessions.map((item) => (
+              <option key={item.id} value={item.id}>
+                {item.title || item.id}
+              </option>
+            ))}
+          </select>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => void handleCreateSession()}
+            disabled={sending}
+            aria-label="新建会话"
+          >
+            <PlusIcon className="size-3.5" />
+            <span className="hidden sm:inline">新会话</span>
+          </Button>
           <Button
             variant={confirmingReset ? "destructive" : "ghost"}
             size="sm"
@@ -297,7 +372,9 @@ export function ChatView() {
             disabled={!session || sending}
           >
             <RotateCcwIcon className="size-3.5" />
-            {confirmingReset ? "确认重置？" : "重置"}
+            <span className="hidden sm:inline">
+              {confirmingReset ? "确认重置？" : "重置"}
+            </span>
           </Button>
         </div>
       </header>

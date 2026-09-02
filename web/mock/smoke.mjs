@@ -51,7 +51,32 @@ try {
     ["markdown 标题", bodyText.includes("SQLite 简介")],
   ];
 
-  // 2) 发送消息 → SSE 流式输出 → 完成后重同步
+  // 2) 创建第二个会话并切回原会话，验证前端使用 scoped API。
+  const sessionSelect = 'select[aria-label="选择会话"]';
+  const initialSessionId = await page.$eval(
+    sessionSelect,
+    (element) => element.value,
+  );
+  checks.push(["会话选择器", Boolean(initialSessionId)]);
+  await page.click('button[aria-label="新建会话"]');
+  await page.waitForFunction(
+    (selector, previousId) => document.querySelector(selector)?.value !== previousId,
+    { timeout: 15000 },
+    sessionSelect,
+    initialSessionId,
+  );
+  const sessionCount = await page.$$eval(
+    `${sessionSelect} option`,
+    (options) => options.length,
+  );
+  checks.push(["创建独立会话", sessionCount === 2]);
+  await page.select(sessionSelect, initialSessionId);
+  await page.waitForFunction(
+    () => document.body.innerText.includes("SQLite 简介"),
+    { timeout: 15000 },
+  );
+
+  // 3) 发送消息 → SSE 流式输出 → 完成后重同步
   // 先展开工具调用卡片，验证参数与结果都在（折叠时 innerText 不含隐藏内容）。
   await page.click("details.group\\/tool summary");
   const expandedText = await page.evaluate(() => document.body.innerText);
