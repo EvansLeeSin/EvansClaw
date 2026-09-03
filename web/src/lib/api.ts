@@ -12,6 +12,8 @@
  *
  * 开发环境下 Vite 把 /api 代理到 127.0.0.1:8787（见 vite.config.ts），
  * 生产环境前后端同源，因此这里不需要配置 API base，统一走相对路径。
+ * 若 Gateway 启用了 Token，调用会自动从当前标签页 sessionStorage 读取并
+ * 附加 Authorization 头；401 由 ChatView 展示 Token 输入框。
  */
 
 import type {
@@ -29,6 +31,47 @@ export class GatewayError extends Error {
     this.status = status;
     this.name = "GatewayError";
   }
+}
+
+const AUTH_TOKEN_STORAGE_KEY = "evansclaw.web.bearer-token";
+let memoryAuthToken = "";
+
+/**
+ * 保存当前浏览器标签页使用的 Web Token；使用 sessionStorage，避免把访问
+ * 凭证长期写入 localStorage。Token 只会通过 Authorization 头发送。
+ */
+export function setAuthToken(token: string): void {
+  memoryAuthToken = token.trim();
+  try {
+    if (typeof sessionStorage === "undefined") return;
+    if (memoryAuthToken) {
+      sessionStorage.setItem(AUTH_TOKEN_STORAGE_KEY, memoryAuthToken);
+    } else {
+      sessionStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+    }
+  } catch {
+    // 隐私模式或禁用存储时仍保留内存中的 Token，当前页面继续可用。
+  }
+}
+
+function getAuthToken(): string {
+  try {
+    if (typeof sessionStorage !== "undefined") {
+      return sessionStorage.getItem(AUTH_TOKEN_STORAGE_KEY) ?? memoryAuthToken;
+    }
+  } catch {
+    // 回退到内存值。
+  }
+  return memoryAuthToken;
+}
+
+function authHeaders(
+  headers: Record<string, string> = {},
+): Record<string, string> {
+  const token = getAuthToken();
+  return token
+    ? { ...headers, Authorization: `Bearer ${token}` }
+    : headers;
 }
 
 /** 拉取当前 Web 身份可见的全部会话。 */
@@ -135,7 +178,7 @@ export async function sendMessage(
     `/api/sessions/${encodeURIComponent(sessionId)}/messages`,
     {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ text }),
     },
   );
@@ -245,7 +288,7 @@ function isApprovalOutcome(value: unknown): value is ApprovalOutcome {
 }
 
 async function getJson<T>(url: string): Promise<T> {
-  const response = await fetch(url);
+  const response = await fetch(url, { headers: authHeaders() });
   if (!response.ok) throw new GatewayError(response.status, await readErrorMessage(response));
   return (await response.json()) as T;
 }
@@ -253,7 +296,7 @@ async function getJson<T>(url: string): Promise<T> {
 async function postJson<T>(url: string, body: unknown): Promise<T> {
   const response = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: authHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify(body),
   });
   if (!response.ok) throw new GatewayError(response.status, await readErrorMessage(response));

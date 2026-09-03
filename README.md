@@ -116,7 +116,9 @@ npm run dev:ui      # 终端 2：Vite http://localhost:5173，/api 代理到 878
 
 无 API Key 时可用 mock Gateway 联调：`cd web && npm run mock`，并用 `npm run smoke` 跑无头浏览器冒烟测试。审批中的写入/外部操作会通过 SSE 推送审批卡片，浏览器只提交批准或拒绝决策。
 
-默认 Web 会话为 `web:local:personal`，与 CLI 的 `personal` 会话分开；它会作为首次打开 Web 时的历史会话，之后可以在页面中创建和切换多个独立会话。可通过 `EVANSCLAW_WEB_HOST`、`EVANSCLAW_WEB_PORT`、`EVANSCLAW_WEB_CORS_ORIGIN` 和 `EVANSCLAW_WEB_SESSION_ID` 配置。`EVANSCLAW_WEB_STATIC_DIR` 可覆盖默认的 `web/dist` 静态目录；显式目录无效时启动会失败并给出错误。Web 的 `write_file` 默认工作区为 `data/workspace`，可通过 `EVANSCLAW_WORKSPACE_DIR` 配置。Gateway 默认只监听本机且没有认证，不应直接暴露到公网。
+默认 Web 会话为 `web:local:personal`，与 CLI 的 `personal` 会话分开；它会作为首次打开 Web 时的历史会话，之后可以在页面中创建和切换多个独立会话。可通过 `EVANSCLAW_WEB_HOST`、`EVANSCLAW_WEB_PORT`、`EVANSCLAW_WEB_CORS_ORIGIN`、`EVANSCLAW_WEB_SESSION_ID` 和 `EVANSCLAW_WEB_USER_ID` 配置。`EVANSCLAW_WEB_STATIC_DIR` 可覆盖默认的 `web/dist` 静态目录；显式目录无效时启动会失败并给出错误。Web 的 `write_file` 默认工作区为 `data/workspace`，可通过 `EVANSCLAW_WORKSPACE_DIR` 配置。
+
+Gateway 默认只监听本机；回环地址可以继续使用本机个人入口。若设置 `EVANSCLAW_WEB_TOKEN`，所有会话、消息和审批 API 都要求 `Authorization: Bearer <token>`，浏览器页面会在收到 401 后提示输入 Token，并只保存到当前标签页的 `sessionStorage`。若监听非回环地址，必须配置 `EVANSCLAW_WEB_TOKEN`，否则启动失败。当前一个 Token 映射一个 `EVANSCLAW_WEB_USER_ID`，健康检查和静态前端资源保持公开。
 
 ## Skills
 
@@ -154,7 +156,7 @@ await session.send("你好", (delta) => process.stdout.write(delta));
 
 ## 后续设计方向
 
-1. 增加动态多会话 Web 路由
+1. 抽象统一的 Channel Adapter 和身份解析边界
 2. 增加 Telegram 或飞书 Channel Adapter
 3. 增加长期记忆、定时任务和事件触发
 

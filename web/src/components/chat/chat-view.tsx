@@ -42,6 +42,7 @@ import {
   resetSession,
   resolveApproval,
   sendMessage,
+  setAuthToken,
 } from "@/lib/api";
 import type { ApprovalResolvedEvent } from "@/lib/api";
 import type {
@@ -68,6 +69,8 @@ export function ChatView() {
   const [streamingText, setStreamingText] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [authRequired, setAuthRequired] = useState(false);
+  const [authInput, setAuthInput] = useState("");
   const [input, setInput] = useState("");
   const [confirmingReset, setConfirmingReset] = useState(false);
   const resetTimer = useRef<ReturnType<typeof setTimeout> | undefined>(
@@ -91,6 +94,7 @@ export function ChatView() {
         }
         if (version !== reloadVersion.current) return;
 
+        setAuthRequired(false);
         setSessions(availableSessions);
         const currentSession =
           availableSessions.find((item) => item.id === selectedSessionId) ??
@@ -114,6 +118,7 @@ export function ChatView() {
         if (!options?.preserveError) setLoadError(null);
       } catch (error) {
         if (version !== reloadVersion.current) return;
+        if (isUnauthorized(error)) setAuthRequired(true);
         setLoadError(
           error instanceof GatewayError
             ? `无法连接 EvansClaw Gateway：${error.message}`
@@ -200,10 +205,28 @@ export function ChatView() {
       setStreamingText(null);
       setLoadError(null);
     } catch (error) {
+      if (isUnauthorized(error)) setAuthRequired(true);
       const detail = error instanceof Error ? error.message : String(error);
       setLoadError(`创建会话失败：${detail}`);
     }
   }, [sending]);
+
+  const handleAuthSubmit = useCallback(
+    (event: React.FormEvent<HTMLFormElement>): void => {
+      event.preventDefault();
+      const token = authInput.trim();
+      if (!token) {
+        setLoadError("请输入 Web 访问令牌。");
+        return;
+      }
+      setAuthToken(token);
+      setAuthInput("");
+      setAuthRequired(false);
+      setLoadError(null);
+      void reload();
+    },
+    [authInput, reload],
+  );
 
   const handleApprovalResolve = useCallback(
     async (
@@ -236,6 +259,7 @@ export function ChatView() {
           ),
         );
       } catch (error) {
+        if (isUnauthorized(error)) setAuthRequired(true);
         const detail = error instanceof Error ? error.message : String(error);
         setApprovals((previous) =>
           previous.map((item) =>
@@ -275,6 +299,7 @@ export function ChatView() {
       });
     } catch (error) {
       requestFailed = true;
+      if (isUnauthorized(error)) setAuthRequired(true);
       // 发送失败：优先展示网关消息，但包一层上下文避免裸显原始 JSON/堆栈。
       const detail = error instanceof Error ? error.message : String(error);
       setLoadError(`对话请求失败：${detail}`);
@@ -307,6 +332,7 @@ export function ChatView() {
     try {
       await resetSession(session.id);
     } catch (error) {
+      if (isUnauthorized(error)) setAuthRequired(true);
       setLoadError(
         error instanceof Error ? error.message : "重置会话失败。",
       );
@@ -346,7 +372,7 @@ export function ChatView() {
             aria-label="选择会话"
             value={selectedSessionId ?? ""}
             onChange={(event) => handleSelectSession(event.target.value)}
-            disabled={sending || sessions.length === 0}
+            disabled={authRequired || sending || sessions.length === 0}
             className="max-w-36 rounded-md border bg-background px-2 py-1 text-xs outline-none focus:ring-2 focus:ring-ring sm:max-w-52"
           >
             {sessions.map((item) => (
@@ -359,7 +385,7 @@ export function ChatView() {
             variant="ghost"
             size="sm"
             onClick={() => void handleCreateSession()}
-            disabled={sending}
+            disabled={authRequired || sending}
             aria-label="新建会话"
           >
             <PlusIcon className="size-3.5" />
@@ -369,7 +395,7 @@ export function ChatView() {
             variant={confirmingReset ? "destructive" : "ghost"}
             size="sm"
             onClick={() => void handleReset()}
-            disabled={!session || sending}
+            disabled={authRequired || !session || sending}
           >
             <RotateCcwIcon className="size-3.5" />
             <span className="hidden sm:inline">
@@ -378,6 +404,32 @@ export function ChatView() {
           </Button>
         </div>
       </header>
+
+      {authRequired && (
+        <div className="border-b bg-muted/40 px-4 py-3">
+          <form
+            className="mx-auto flex w-full max-w-3xl items-end gap-2"
+            onSubmit={handleAuthSubmit}
+          >
+            <label className="min-w-0 flex-1 text-xs font-medium" htmlFor="web-auth-token">
+              Web 访问令牌
+              <input
+                id="web-auth-token"
+                type="password"
+                value={authInput}
+                onChange={(event) => setAuthInput(event.target.value)}
+                placeholder="粘贴 EVANSCLAW_WEB_TOKEN"
+                autoComplete="off"
+                autoFocus
+                className="mt-1 block h-9 w-full rounded-md border bg-background px-3 text-sm font-normal outline-none focus:ring-2 focus:ring-ring"
+              />
+            </label>
+            <Button type="submit" size="sm">
+              连接
+            </Button>
+          </form>
+        </div>
+      )}
 
       {loadError && (
         <div
@@ -472,6 +524,10 @@ export function ChatView() {
       </footer>
     </div>
   );
+}
+
+function isUnauthorized(error: unknown): boolean {
+  return error instanceof GatewayError && error.status === 401;
 }
 
 function StreamingMessage({ text }: { text: string }) {

@@ -574,7 +574,7 @@ npm run web
 
 `npm run web` 的 `preweb` 生命周期会先执行 `build:ui`，因此一个命令即可构建前端并启动完整应用；浏览器直接访问 `http://127.0.0.1:8787`。缺少 `web/dist` 时 `dev:web` 仍可退化为纯 API 模式。默认静态目录可用 `EVANSCLAW_WEB_STATIC_DIR` 覆盖，显式目录无效时启动失败。
 
-默认监听 `127.0.0.1:8787`，可通过 `EVANSCLAW_WEB_HOST`、`EVANSCLAW_WEB_PORT`、`EVANSCLAW_WEB_CORS_ORIGIN` 和 `EVANSCLAW_WEB_SESSION_ID` 配置。当前 Gateway 没有认证，只适合本机或受信任的开发环境；Web 入口固定使用本机 Web 身份，支持创建、列出和切换多个独立会话。多会话由进程级 AgentManager 管理；多用户认证和外部平台适配仍待实现。
+默认监听 `127.0.0.1:8787`，可通过 `EVANSCLAW_WEB_HOST`、`EVANSCLAW_WEB_PORT`、`EVANSCLAW_WEB_CORS_ORIGIN`、`EVANSCLAW_WEB_SESSION_ID` 和 `EVANSCLAW_WEB_USER_ID` 配置。设置 `EVANSCLAW_WEB_TOKEN` 后，会话、消息和审批 API 要求 Bearer Token；前端在 401 时提示输入，并只保存到当前标签页的 `sessionStorage`。监听非回环地址时必须配置 Token，否则启动失败。当前一个 Token 映射一个 Web 用户；多 Token/登录系统和外部平台适配仍待实现。Web 入口支持创建、列出和切换多个独立会话，多会话由进程级 AgentManager 管理。
 
 ### 当前状态：Web 前端（web/）已完成基础聊天界面
 
