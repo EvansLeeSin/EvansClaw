@@ -236,6 +236,30 @@ test("Bearer Token 认证器只接受匹配的 Token 并返回服务端身份", 
   );
 });
 
+test("Web Gateway 在非回环地址没有认证时拒绝启动", async () => {
+  const sessionStore = new InMemorySessionStore();
+  const session = await sessionStore.getOrCreate("remote-session", {
+    conversationId: "remote-session",
+    channel: "web",
+    userId: "local",
+  });
+  const gateway = new WebGateway({
+    chat: {
+      async send() {},
+      async reset() {},
+    },
+    sessionStore,
+    session,
+    host: "0.0.0.0",
+    port: 0,
+  });
+
+  await assert.rejects(
+    gateway.listen(),
+    /必须配置认证适配器/,
+  );
+});
+
 test("Web Gateway 保护 API 并从认证适配器建立用户会话范围", async () => {
   const fixture = await createDynamicFixture({
     authenticator: new BearerTokenAuthenticator({
@@ -284,6 +308,17 @@ test("Web Gateway 保护 API 并从认证适配器建立用户会话范围", asy
     assert.equal(createdResponse.status, 201);
     const created = (await createdResponse.json() as { session: SessionRecord }).session;
     assert.equal(created.userId, "alice");
+
+    const message = await fetch(
+      `${fixture.address.url}/api/sessions/${encodeURIComponent(created.id)}/messages`,
+      {
+        method: "POST",
+        headers: { ...headers, "content-type": "application/json" },
+        body: JSON.stringify({ text: "认证后消息" }),
+      },
+    );
+    assert.equal(message.status, 200);
+    assert.match(await message.text(), /认证后消息/);
 
     const foreign = await fixture.sessionStore.getOrCreate("web:foreign-auth", {
       conversationId: "web:foreign-auth",

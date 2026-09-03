@@ -183,6 +183,11 @@ export class WebGateway {
 
   async listen(): Promise<WebGatewayAddress> {
     if (this.server) throw new Error("Web Gateway 已经启动。");
+    if (!isLoopbackHost(this.host) && !this.authenticator) {
+      throw new Error(
+        "非本机 Web Gateway 必须配置认证适配器才能启动。",
+      );
+    }
 
     const server = createServer((request, response) => {
       void this.handleRequest(request, response).catch((error: unknown) => {
@@ -450,9 +455,16 @@ export class WebGateway {
       };
     }
 
-    const principal = this.authenticator.authenticate(
-      request.headers.authorization,
-    );
+    let principal: WebPrincipal | null;
+    try {
+      principal = this.authenticator.authenticate(
+        request.headers.authorization,
+      );
+    } catch {
+      // Custom authentication adapters must fail closed rather than turn an
+      // adapter error into an accidentally trusted request.
+      return null;
+    }
     if (!isValidWebPrincipal(principal)) return null;
     return {
       channel: this.channel,
@@ -927,6 +939,15 @@ function positiveInteger(value: number, name: string): number {
     throw new Error(`${name} 必须是正整数。`);
   }
   return value;
+}
+
+function isLoopbackHost(host: string): boolean {
+  const normalized = host.trim().toLowerCase();
+  return (
+    normalized === "localhost" ||
+    normalized === "127.0.0.1" ||
+    normalized === "::1"
+  );
 }
 
 function formatHost(host: string): string {
