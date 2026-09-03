@@ -3,9 +3,13 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { assertConfig } from "./config.js";
 import { createAgentManagerRuntime } from "./app/agent-manager-runtime.js";
+import {
+  BearerTokenAuthenticator,
+} from "./gateway/web-auth.js";
 import { createDynamicWebGateway } from "./gateway/web-runtime.js";
 
 const DEFAULT_WEB_SESSION_ID = "web:local:personal";
+const DEFAULT_WEB_USER_ID = "local";
 const DEFAULT_WEB_HOST = "127.0.0.1";
 const DEFAULT_WEB_PORT = 8787;
 const DEFAULT_CORS_ORIGIN = "http://localhost:5173";
@@ -50,12 +54,25 @@ async function main(): Promise<void> {
     process.env.EVANSCLAW_WEB_CORS_ORIGIN ?? DEFAULT_CORS_ORIGIN;
   const sessionId =
     process.env.EVANSCLAW_WEB_SESSION_ID ?? DEFAULT_WEB_SESSION_ID;
+  const userId =
+    process.env.EVANSCLAW_WEB_USER_ID?.trim() || DEFAULT_WEB_USER_ID;
+  const token = process.env.EVANSCLAW_WEB_TOKEN?.trim();
 
-  if (!isLoopbackHost(host)) {
-    console.warn(
-      "警告：Web Gateway 未启用认证，当前监听地址不是本机回环地址；仅建议在可信网络中使用。",
+  // 回环地址可以继续使用本机个人入口；一旦监听远程地址，必须先配置
+  // Bearer Token，避免把已认证的 Web 工具能力暴露到可信边界之外。
+  if (!isLoopbackHost(host) && !token) {
+    throw new Error(
+      "非本机 Web Gateway 必须配置 EVANSCLAW_WEB_TOKEN 才能启动。",
     );
   }
+  const authenticator = token
+    ? new BearerTokenAuthenticator({
+        token,
+        userId,
+        identity: { authenticated: true },
+        profile: "web-workspace",
+      })
+    : undefined;
 
   // 静态目录属于启动配置，先于数据库/Agent 运行时校验，失败时不遗留资源。
   const staticDir = await resolveStaticDir();
@@ -69,8 +86,9 @@ async function main(): Promise<void> {
       sessionId,
       conversationId: sessionId,
       channel: "web",
-      userId: "local",
-      // 当前 Web Gateway 是本机个人入口；后续多用户适配器不能继承此信任。
+      userId,
+      // 无 Token 的回环模式仍是本机个人入口；远程模式由 authenticator
+      // 从请求头提供同一用户身份，浏览器不能提交这些字段。
       identity: { authenticated: true },
       // Web 已有审批 API/SSE；CLI 没有审批通道，因此只在 Web 装配写文件工具。
       profile: "web-workspace",
@@ -85,9 +103,10 @@ async function main(): Promise<void> {
     corsOrigin,
     staticDir,
     channel: "web",
-    userId: "local",
+    userId,
     identity: { authenticated: true },
     profile: "web-workspace",
+    authenticator,
     defaultSessionId: sessionId,
   });
 

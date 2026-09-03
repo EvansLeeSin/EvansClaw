@@ -10,6 +10,10 @@ import {
 } from "../src/session/session-store.js";
 import { InMemoryApprovalBroker } from "../src/tools/approval-broker.js";
 import { AgentManager } from "../src/agent/agent-manager.js";
+import {
+  BearerTokenAuthenticator,
+  type WebAuthenticator,
+} from "../src/gateway/web-auth.js";
 import { WebGateway } from "../src/gateway/web-gateway.js";
 
 async function createFixture(options?: { staticDir?: string }) {
@@ -61,7 +65,10 @@ async function createFixture(options?: { staticDir?: string }) {
   };
 }
 
-async function createDynamicFixture(options?: { approvals?: boolean }) {
+async function createDynamicFixture(options?: {
+  approvals?: boolean;
+  authenticator?: WebAuthenticator;
+}) {
   const sessionStore = new InMemorySessionStore();
   const approvalBroker = new InMemoryApprovalBroker();
   const sent: string[] = [];
@@ -123,6 +130,7 @@ async function createDynamicFixture(options?: { approvals?: boolean }) {
     userId: "local",
     identity: { authenticated: true },
     profile: "read-only",
+    authenticator: options?.authenticator,
     createSessionId: () => `web:dynamic-${++nextSessionNumber}`,
     host: "127.0.0.1",
     port: 0,
@@ -201,6 +209,97 @@ async function createApprovalFixture() {
     },
   };
 }
+
+test("Bearer Token 认证器只接受匹配的 Token 并返回服务端身份", () => {
+  const authenticator = new BearerTokenAuthenticator({
+    token: "test-secret-token",
+    userId: "alice",
+    profile: "read-only",
+  });
+
+  assert.deepEqual(authenticator.authenticate("Bearer test-secret-token"), {
+    userId: "alice",
+    identity: { authenticated: true },
+    profile: "read-only",
+  });
+  assert.equal(authenticator.authenticate("Bearer wrong-token"), null);
+  assert.equal(authenticator.authenticate("Basic test-secret-token"), null);
+  assert.equal(authenticator.authenticate(["Bearer test-secret-token"]), null);
+  assert.equal(authenticator.authenticate(undefined), null);
+  assert.throws(
+    () =>
+      new BearerTokenAuthenticator({
+        token: "has whitespace",
+        userId: "alice",
+      }),
+    /不能包含空白字符/,
+  );
+});
+
+test("Web Gateway 保护 API 并从认证适配器建立用户会话范围", async () => {
+  const fixture = await createDynamicFixture({
+    authenticator: new BearerTokenAuthenticator({
+      token: "alice-secret-token",
+      userId: "alice",
+    }),
+  });
+  const headers = { authorization: "Bearer alice-secret-token" };
+  try {
+    const health = await fetch(`${fixture.address.url}/api/health`);
+    assert.equal(health.status, 200);
+
+    const preflight = await fetch(`${fixture.address.url}/api/sessions`, {
+      method: "OPTIONS",
+      headers: {
+        origin: "http://localhost:5173",
+        "access-control-request-headers": "authorization",
+      },
+    });
+    assert.equal(preflight.status, 204);
+    assert.match(
+      preflight.headers.get("access-control-allow-headers") ?? "",
+      /Authorization/,
+    );
+
+    const unauthorized = await fetch(`${fixture.address.url}/api/sessions`);
+    assert.equal(unauthorized.status, 401);
+    assert.equal(unauthorized.headers.get("www-authenticate"), 'Bearer realm="evansclaw"');
+    assert.equal((await unauthorized.json()).error, "unauthorized");
+
+    const wrongToken = await fetch(`${fixture.address.url}/api/sessions`, {
+      headers: { authorization: "Bearer wrong-token" },
+    });
+    assert.equal(wrongToken.status, 401);
+
+    const listed = await fetch(`${fixture.address.url}/api/sessions`, { headers });
+    assert.equal(listed.status, 200);
+    assert.deepEqual(await listed.json(), { sessions: [] });
+
+    const createdResponse = await fetch(`${fixture.address.url}/api/sessions`, {
+      method: "POST",
+      headers: { ...headers, "content-type": "application/json" },
+      // 用户字段只是请求体，Gateway 必须忽略它。
+      body: JSON.stringify({ userId: "bob", sessionId: "forged" }),
+    });
+    assert.equal(createdResponse.status, 201);
+    const created = (await createdResponse.json() as { session: SessionRecord }).session;
+    assert.equal(created.userId, "alice");
+
+    const foreign = await fixture.sessionStore.getOrCreate("web:foreign-auth", {
+      conversationId: "web:foreign-auth",
+      channel: "web",
+      userId: "bob",
+    });
+    const hidden = await fetch(
+      `${fixture.address.url}/api/sessions/${encodeURIComponent(foreign.id)}/messages`,
+      { headers },
+    );
+    assert.equal(hidden.status, 404);
+  } finally {
+    await fixture.gateway.close();
+    await fixture.manager.close();
+  }
+});
 
 test("动态 Web Gateway 创建并隔离多个 session", async () => {
   const fixture = await createDynamicFixture();

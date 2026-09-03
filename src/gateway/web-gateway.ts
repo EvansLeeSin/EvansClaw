@@ -13,6 +13,10 @@ import type {
   AgentSessionProfile,
 } from "../agent/agent-manager.js";
 import type {
+  WebAuthenticator,
+  WebPrincipal,
+} from "./web-auth.js";
+import type {
   ApprovalActor,
   ApprovalBroker,
   ApprovalRequest,
@@ -40,6 +44,13 @@ type GatewaySession = {
   run<T>(operation: (chat: WebChat) => Promise<T>): Promise<T>;
 };
 
+type WebRequestScope = {
+  channel: string;
+  userId: string;
+  identity: ToolPolicyIdentity;
+  profile: AgentSessionProfile;
+};
+
 export interface WebGatewayOptions {
   /** Legacy single-session wiring; omit these fields when using manager mode. */
   chat?: WebChat;
@@ -55,6 +66,8 @@ export interface WebGatewayOptions {
   profile?: AgentSessionProfile;
   /** Optional default for the backwards-compatible /api/approvals aliases. */
   defaultSessionId?: string;
+  /** Protects API routes; static assets and health remain publicly readable. */
+  authenticator?: WebAuthenticator;
   /** Server-side ID generator; clients cannot provide session IDs. */
   createSessionId?: () => string;
   /** 运行时共享的审批 Broker；缺少时审批 API 以 503 fail-closed。 */
@@ -110,6 +123,7 @@ export class WebGateway {
   private readonly identity: ToolPolicyIdentity;
   private readonly profile: AgentSessionProfile;
   private readonly defaultSessionId: string | undefined;
+  private readonly authenticator: WebAuthenticator | undefined;
   private readonly createSessionId: () => string;
   private readonly host: string;
   private readonly port: number;
@@ -148,6 +162,7 @@ export class WebGateway {
     this.profile = options.profile ?? "read-only";
     this.defaultSessionId =
       options.defaultSessionId ?? options.session?.id;
+    this.authenticator = options.authenticator;
     this.createSessionId =
       options.createSessionId ?? (() => `web:${randomUUID()}`);
     this.host = options.host ?? DEFAULT_HOST;
@@ -258,13 +273,30 @@ export class WebGateway {
       return;
     }
 
+    // The browser must be able to download the login form before it has a
+    // token. API routes below are the protected boundary, not static assets.
+    if (
+      (request.method === "GET" || request.method === "HEAD") &&
+      segments[0] !== "api" &&
+      this.staticDir
+    ) {
+      await this.handleStatic(url.pathname, response, request.method === "HEAD");
+      return;
+    }
+
+    const scope = this.resolveRequestScope(request);
+    if (!scope) {
+      this.sendUnauthorized(response);
+      return;
+    }
+
     if (request.method === "GET" && isSamePath(segments, ["api", "sessions"])) {
-      await this.handleSessionList(response);
+      await this.handleSessionList(response, scope);
       return;
     }
 
     if (request.method === "POST" && isSamePath(segments, ["api", "sessions"])) {
-      await this.handleSessionCreate(request, response);
+      await this.handleSessionCreate(request, response, scope);
       return;
     }
 
@@ -272,7 +304,7 @@ export class WebGateway {
     // session. Dynamic clients use the scoped paths below so a browser cannot
     // accidentally resolve an approval belonging to another session.
     if (request.method === "GET" && isSamePath(segments, ["api", "approvals"])) {
-      const session = await this.resolveDefaultSession();
+      const session = await this.resolveDefaultSession(scope);
       if (!session) return this.sendNotFound(response);
       await this.handleApprovalList(response, session);
       return;
@@ -284,7 +316,7 @@ export class WebGateway {
       segments[0] === "api" &&
       segments[1] === "approvals"
     ) {
-      const session = await this.resolveDefaultSession();
+      const session = await this.resolveDefaultSession(scope);
       if (!session) return this.sendNotFound(response);
       await this.handleApprovalResolution(request, response, segments[2], session);
       return;
@@ -297,7 +329,7 @@ export class WebGateway {
       segments[1] === "sessions" &&
       segments[3] === "approvals"
     ) {
-      const session = await this.resolveSession(segments[2]);
+      const session = await this.resolveSession(segments[2], scope);
       if (!session) return this.sendNotFound(response);
       await this.handleApprovalList(response, session);
       return;
@@ -310,7 +342,7 @@ export class WebGateway {
       segments[1] === "sessions" &&
       segments[3] === "approvals"
     ) {
-      const session = await this.resolveSession(segments[2]);
+      const session = await this.resolveSession(segments[2], scope);
       if (!session) return this.sendNotFound(response);
       await this.handleApprovalResolution(
         request,
@@ -328,7 +360,7 @@ export class WebGateway {
       segments[1] === "sessions" &&
       segments[3] === "messages"
     ) {
-      const session = await this.resolveSession(segments[2]);
+      const session = await this.resolveSession(segments[2], scope);
       if (!session) return this.sendNotFound(response);
       const messages = await this.sessionStore.load(session.session.id);
       this.sendJson(response, 200, { session: session.session, messages });
@@ -342,7 +374,7 @@ export class WebGateway {
       segments[1] === "sessions" &&
       segments[3] === "messages"
     ) {
-      const session = await this.resolveSession(segments[2]);
+      const session = await this.resolveSession(segments[2], scope);
       if (!session) return this.sendNotFound(response);
       await this.handleMessage(request, response, session);
       return;
@@ -355,20 +387,9 @@ export class WebGateway {
       segments[1] === "sessions" &&
       segments[3] === "reset"
     ) {
-      const session = await this.resolveSession(segments[2]);
+      const session = await this.resolveSession(segments[2], scope);
       if (!session) return this.sendNotFound(response);
       await this.handleReset(response, session);
-      return;
-    }
-
-    if (
-      (request.method === "GET" || request.method === "HEAD") &&
-      segments[0] !== "api" &&
-      this.staticDir
-    ) {
-      // 非 API 的 GET/HEAD 请求交给前端静态托管（SPA 回退在内部处理）；
-      // HEAD 只返回头部不写正文，方便缓存探测和健康检查工具。
-      await this.handleStatic(url.pathname, response, request.method === "HEAD");
       return;
     }
 
@@ -417,18 +438,49 @@ export class WebGateway {
     response.end(headOnly ? undefined : body);
   }
 
-  private async handleSessionList(response: ServerResponse): Promise<void> {
+  private resolveRequestScope(
+    request: IncomingMessage,
+  ): WebRequestScope | null {
+    if (!this.authenticator) {
+      return {
+        channel: this.channel,
+        userId: this.userId,
+        identity: this.identity,
+        profile: this.profile,
+      };
+    }
+
+    const principal = this.authenticator.authenticate(
+      request.headers.authorization,
+    );
+    if (!isValidWebPrincipal(principal)) return null;
+    return {
+      channel: this.channel,
+      userId: principal.userId,
+      identity: principal.identity,
+      profile: principal.profile,
+    };
+  }
+
+  private async handleSessionList(
+    response: ServerResponse,
+    scope: WebRequestScope,
+  ): Promise<void> {
     if (!this.manager) {
       const session = await this.refreshStaticSession();
+      if (!sameSessionScope(session, scope)) {
+        this.sendNotFound(response);
+        return;
+      }
       this.sendJson(response, 200, { sessions: [session] });
       return;
     }
 
-    // The local Web identity is a fixed scope until a real authentication
-    // adapter is introduced; never let the browser supply channel or userId.
+    // The scope comes from the trusted adapter or the loopback fallback; the
+    // browser never chooses channel, userId, identity, or tool capabilities.
     const sessions = await this.sessionStore.listSessions({
-      channel: this.channel,
-      userId: this.userId,
+      channel: scope.channel,
+      userId: scope.userId,
     });
     this.sendJson(response, 200, { sessions });
   }
@@ -436,6 +488,7 @@ export class WebGateway {
   private async handleSessionCreate(
     request: IncomingMessage,
     response: ServerResponse,
+    scope: WebRequestScope,
   ): Promise<void> {
     if (!this.manager) {
       this.sendNotFound(response);
@@ -445,14 +498,14 @@ export class WebGateway {
     // Drain an optional request body so keep-alive connections remain usable;
     // the server, rather than the client, chooses the new session ID.
     await drainRequest(request, this.maxBodyBytes);
-    const session = await this.createDynamicSession();
+    const session = await this.createDynamicSession(scope);
     this.sendJson(response, 201, { session: session.session });
   }
 
-  private createDynamicSession(): Promise<GatewaySession> {
+  private createDynamicSession(scope: WebRequestScope): Promise<GatewaySession> {
     const next = this.sessionCreationTail.then(
-      () => this.createDynamicSessionInternal(),
-      () => this.createDynamicSessionInternal(),
+      () => this.createDynamicSessionInternal(scope),
+      () => this.createDynamicSessionInternal(scope),
     );
     this.sessionCreationTail = next.then(
       () => undefined,
@@ -461,7 +514,9 @@ export class WebGateway {
     return next;
   }
 
-  private async createDynamicSessionInternal(): Promise<GatewaySession> {
+  private async createDynamicSessionInternal(
+    scope: WebRequestScope,
+  ): Promise<GatewaySession> {
     const manager = this.manager;
     if (!manager) throw new Error("动态 Web Gateway 未配置 AgentManager。");
 
@@ -474,11 +529,11 @@ export class WebGateway {
 
       const handle = await manager.getOrCreate({
         sessionId,
-        channel: this.channel,
+        channel: scope.channel,
         conversationId: sessionId,
-        userId: this.userId,
-        identity: this.identity,
-        profile: this.profile,
+        userId: scope.userId,
+        identity: scope.identity,
+        profile: scope.profile,
       });
       return {
         session: handle.session,
@@ -490,7 +545,10 @@ export class WebGateway {
     throw new Error("无法分配唯一的 Web sessionId。");
   }
 
-  private async resolveSession(sessionId: string): Promise<GatewaySession | null> {
+  private async resolveSession(
+    sessionId: string,
+    scope: WebRequestScope,
+  ): Promise<GatewaySession | null> {
     if (!isSafeSessionId(sessionId)) return null;
 
     if (!this.manager) {
@@ -498,6 +556,7 @@ export class WebGateway {
         return null;
       }
       const session = await this.refreshStaticSession();
+      if (!sameSessionScope(session, scope)) return null;
       return {
         session,
         chat: this.chat,
@@ -506,7 +565,7 @@ export class WebGateway {
     }
 
     const stored = await this.sessionStore.getSession(sessionId);
-    if (!stored || stored.channel !== this.channel || stored.userId !== this.userId) {
+    if (!stored || !sameSessionScope(stored, scope)) {
       // Do not distinguish a foreign session from a missing session at HTTP level.
       return null;
     }
@@ -516,8 +575,8 @@ export class WebGateway {
       channel: stored.channel,
       conversationId: stored.conversationId,
       userId: stored.userId,
-      identity: this.identity,
-      profile: this.profile,
+      identity: scope.identity,
+      profile: scope.profile,
     });
     return {
       session: handle.session,
@@ -526,9 +585,11 @@ export class WebGateway {
     };
   }
 
-  private async resolveDefaultSession(): Promise<GatewaySession | null> {
+  private async resolveDefaultSession(
+    scope: WebRequestScope,
+  ): Promise<GatewaySession | null> {
     const sessionId = this.defaultSessionId;
-    return sessionId ? this.resolveSession(sessionId) : null;
+    return sessionId ? this.resolveSession(sessionId, scope) : null;
   }
 
   private async refreshStaticSession(): Promise<SessionRecord> {
@@ -750,7 +811,10 @@ export class WebGateway {
 
   private applyCors(response: ServerResponse): void {
     response.setHeader("Access-Control-Allow-Origin", this.corsOrigin);
-    response.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    response.setHeader(
+      "Access-Control-Allow-Headers",
+      "Content-Type, Authorization",
+    );
     response.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     response.setHeader("Vary", "Origin");
   }
@@ -766,6 +830,14 @@ export class WebGateway {
       "Content-Length": Buffer.byteLength(body),
     });
     response.end(body);
+  }
+
+  private sendUnauthorized(response: ServerResponse): void {
+    response.setHeader("WWW-Authenticate", 'Bearer realm="evansclaw"');
+    this.sendJson(response, 401, {
+      error: "unauthorized",
+      message: "需要有效的 Web 访问令牌。",
+    });
   }
 
   private sendNotFound(response: ServerResponse): void {
@@ -809,6 +881,38 @@ function readApprovalDecision(
   return body.decision === "approve" || body.decision === "deny"
     ? body.decision
     : null;
+}
+
+function isValidWebPrincipal(
+  value: WebPrincipal | null,
+): value is WebPrincipal {
+  if (!value || typeof value !== "object") return false;
+  return (
+    isSafeScopeText(value.userId) &&
+    Boolean(value.identity) &&
+    typeof value.identity.authenticated === "boolean" &&
+    (value.profile === "read-only" || value.profile === "web-workspace")
+  );
+}
+
+function sameSessionScope(
+  session: SessionRecord,
+  scope: WebRequestScope,
+): boolean {
+  return session.channel === scope.channel && session.userId === scope.userId;
+}
+
+function isSafeScopeText(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= 256 &&
+    value === value.trim() &&
+    [...value].every((character) => {
+      const code = character.codePointAt(0) ?? 0;
+      return code >= 0x20 && code !== 0x7f;
+    })
+  );
 }
 
 function positivePort(value: number): number {
