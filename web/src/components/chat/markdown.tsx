@@ -1,24 +1,24 @@
 /**
- * 聊天消息内的 Markdown 渲染。
+ * 聊天消息内的 Markdown 渲染入口。
  *
- * 助手的回复以 Markdown 为主（含 GFM 表格、 fenced 代码块），
- * 用 react-markdown + rehype-highlight 渲染；代码块固定深色
- * （见 index.css 中 .chat-markdown 的样式），与主流聊天产品一致。
+ * Markdown/GFM/高亮依赖体积较大，因此放进独立异步 chunk；首次加载期间
+ * 保留原始文本，避免消息区域空白，后续由完整渲染器原位替换。
  */
 
-import ReactMarkdown from "react-markdown";
-import rehypeHighlight from "rehype-highlight";
-import remarkGfm from "remark-gfm";
+import { lazy, Suspense } from "react";
+
+const MarkdownRenderer = lazy(() => import("./markdown-renderer"));
 
 export function Markdown({ text }: { text: string }) {
   return (
-    <div className="chat-markdown">
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        rehypePlugins={[rehypeHighlight]}
-      >
-        {text}
-      </ReactMarkdown>
-    </div>
+    <Suspense
+      fallback={
+        <div className="chat-markdown whitespace-pre-wrap break-words">
+          {text}
+        </div>
+      }
+    >
+      <MarkdownRenderer text={text} />
+    </Suspense>
   );
 }

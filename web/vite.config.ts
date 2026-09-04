@@ -1,6 +1,6 @@
 import tailwindcss from '@tailwindcss/vite'
 import react from '@vitejs/plugin-react'
-import path from 'node:path'
+import { resolve } from 'node:path'
 import { defineConfig } from 'vite'
 
 // https://vite.dev/config/
@@ -8,7 +8,8 @@ export default defineConfig({
   plugins: [react(), tailwindcss()],
   resolve: {
     alias: {
-      '@': path.resolve(__dirname, './src'),
+      // import.meta.dirname keeps the config compatible with Vite's native ESM loader.
+      '@': resolve(import.meta.dirname, './src'),
     },
   },
   // 开发期把 /api 代理到本地 Web Gateway，绕开 CORS；生产构建由 Gateway 同源托管。
