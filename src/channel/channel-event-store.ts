@@ -1359,8 +1359,8 @@ function sameInboundMessage(
     left.conversationKind === right.conversationKind &&
     left.senderId === right.senderId &&
     left.text === right.text &&
-    // receivedAt is the local adapter-ingress timestamp and may differ when a
-    // platform retries the same immutable event; it is not replay identity.
+    // Adapters may recalculate this observation timestamp while replaying an
+    // immutable event; it is metadata, not replay identity.
     (left.replyToMessageId ?? null) === (right.replyToMessageId ?? null)
   );
 }

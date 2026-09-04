@@ -166,16 +166,18 @@ await session.send("你好", (delta) => process.stdout.write(delta));
 
 ## Channel Adapter 与传输状态
 
-统一的 ChannelAdapter 协议和可信 Session 路由已完成，当前外部渠道仍未启动实际适配器：
+统一的 ChannelAdapter 协议、可信 Session 路由和 Telegram Long Polling Adapter 已完成；Telegram 运行入口和生产配置仍在下一阶段：
 
 - Adapter 只负责平台协议解析、连接和发送，不直接调用 Agent；
 - 入站消息必须携带 `externalMessageId`，由 SQLite Inbox 按 adapter/account 去重；
 - Allowlist 在服务端映射 canonical `userId`，默认只允许私聊；
 - Session ID 使用版本化元组和 SHA-256 派生，不能由用户文本或客户端字段决定；
 - SQLite Outbox 保存最终回复和投递重试，发送失败不会重新执行 Agent turn；
-- 外部渠道 V1 固定使用 `read-only` profile，不开放 `write_file` 或审批。
+- 外部渠道 V1 固定使用 `read-only` profile，不开放 `write_file` 或审批；
+- `src/channel/telegram/telegram-adapter.ts` 使用 Long Polling，仅标准化私聊文本，`update_id` 作为入站幂等 ID，并支持最终回复分片、回复引用、429 等待和 AbortSignal 停止；
+- `src/channel/telegram/telegram-api.ts` 使用原生 `fetch` 调用 Bot API，不引入 Telegram SDK，网络错误不会把 Bot Token 写入错误消息。
 
-阶段 1、2、3 已完成：ChannelGateway 已把可信路由、Inbox、AgentManager、ChatService 和 Outbox/DeliveryWorker 串联起来；下一步是实现 Telegram Long Polling Adapter 和运行入口。之后再接入飞书、钉钉等平台。Web 继续使用自己的 REST/SSE Gateway，CLI 继续使用本地交互循环。
+阶段 1、2、3、4 已完成：ChannelGateway 已把可信路由、Inbox、AgentManager、ChatService 和 Outbox/DeliveryWorker 串联起来，Telegram Adapter 已完成；下一步是增加 Telegram 运行入口、Allowlist 配置和端到端测试。之后再接入飞书、钉钉等平台。Web 继续使用自己的 REST/SSE Gateway，CLI 继续使用本地交互循环。
 
 Tool Policy、审批 Broker、审批持久化和 Web 审批交互已完成；CLI 仍只注册三个只读工具，Web 另外注册受审批保护的 `write_file`。
 

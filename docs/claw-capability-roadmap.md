@@ -678,10 +678,22 @@ Session route 的规范化元组包含：
 - 启动时会重新调度遗留的 `received` Inbox；`uncertain` 入站 turn 不会自动重跑；
 - Gateway 停止接收新事件、停止 Adapter 和投递调用后，再等待已 claim 的入站队列；它不会关闭共享 AgentManager 或 SQLite。
 
+### 阶段 4 状态：Telegram Long Polling Adapter 已完成
+
+阶段 4 已实现 `src/channel/telegram/telegram-api.ts` 和 `src/channel/telegram/telegram-adapter.ts`：
+
+- 使用原生 `fetch` 调用 Telegram Bot API，启动时通过 `getMe` 校验 Bot Token；
+- 使用 `getUpdates` Long Polling，限制接收私聊文本，忽略群聊、频道、媒体和 Bot 自发消息；
+- 使用 Telegram `update_id` 作为 `externalMessageId`，使用当前 `message_id` 作为回复引用；
+- 入站处理只有在 `ChannelSink.accept()` 成功返回后才推进内存 offset；持久化失败会保留该 update，等待后续重试；
+- `sendMessage` 支持 4096 字符分片，最终回复只对首片设置引用；
+- 轮询和发送均处理 Telegram 429 的 `retry_after`，网络错误使用有界退避；无效 Token 不会无限重连；
+- `stop()` 会中断当前 Long Polling 请求和等待中的退避，不关闭 Gateway 或共享运行时资源。
+
 ### 后续实现阶段
 
-1. 实现 Telegram Long Polling Adapter；
-2. 增加 Telegram 运行入口、Allowlist 配置和端到端测试；
+1. 增加 Telegram 运行入口、环境变量解析和 Allowlist 配置；
+2. 增加 Telegram 端到端 smoke test 与运行文档；
 3. 在可靠性验证后再接入飞书、钉钉等其他平台。
 
 现有 Web Gateway 继续保留自己的 REST/SSE/审批接口，CLI 继续使用本地交互循环；两者共享 AgentManager/ChatService，但暂不强行实现 Push ChannelAdapter。

@@ -77,7 +77,7 @@ CLI / 外部渠道 / Cron
 4. 用户身份、渠道来源和会话标识在进入 Agent 前确定。
 5. 工具权限由策略层决定，不能由模型通过自然语言自行获得。
 
-当前 EvansClaw 已实现 CLI、`ChatService` / `SessionStore` 边界、一个进程级 AgentManager、动态多会话且带 Bearer Token 的 Web Gateway，以及阶段 1/2/3 的外部 ChannelAdapter 协议、可信 Session 路由、SQLite Inbox/Outbox 和 ChannelGateway/DeliveryWorker；真实外部平台 Adapter 和多用户登录系统仍属于后续模块。
+当前 EvansClaw 已实现 CLI、`ChatService` / `SessionStore` 边界、一个进程级 AgentManager、动态多会话且带 Bearer Token 的 Web Gateway，以及阶段 1/2/3/4 的外部 ChannelAdapter 协议、可信 Session 路由、SQLite Inbox/Outbox、ChannelGateway/DeliveryWorker 和 Telegram Long Polling Adapter；Telegram 运行入口及多用户登录系统仍属于后续模块。
 
 ### 2.3 Skills 使用渐进式披露
 
@@ -246,7 +246,7 @@ Web Frontend
 - AgentManager 为每个 session 创建独立 Agent/ChatService，并在 session 级别串行化请求；
 - CLI 和 Web 通过 `src/app/agent-manager-runtime.ts` 共享 Skill、Tool、Context、审批和 Session 组装逻辑；
 - CORS、请求体大小、文本长度和路径范围均有限制；
-- Push ChannelAdapter 通过独立 ChannelGateway 接入，阶段 1/2/3 已完成协议、可信路由、传输状态持久化、按 session 调度和最终回复投递；外部渠道 V1 固定 read-only，不继承 Web 的断线取消审批语义。
+- Push ChannelAdapter 通过独立 ChannelGateway 接入，阶段 1/2/3/4 已完成协议、可信路由、传输状态持久化、按 session 调度、最终回复投递和 Telegram Long Polling Adapter；外部渠道 V1 固定 read-only，不继承 Web 的断线取消审批语义。
 
 这是对 Hermes/OpenClaw“渠道通过 Gateway 进入 Agent”边界思想的最小化实现，不是复制它们的前端或运行时。Web/CLI 保持各自的交互入口，后续外部渠道通过 ChannelGateway 复用 AgentManager、ChatService 和可靠投递状态。
 
@@ -382,7 +382,7 @@ EvansClaw
 
 尚未落地：
 
-- Telegram/飞书等真实外部 Adapter 和多用户登录系统；
+- Telegram 运行入口、飞书等其他真实外部 Adapter 和多用户登录系统；
 - Cron；
 - 长期记忆和用户画像。
 
