@@ -20,11 +20,12 @@
 - 支持按 `channel`、`userId`、`conversationId` 和 `sessionId` 隔离搜索
 - 使用 migration 表、事务、WAL 和 SQLite 写锁重试
 - 数据库固定保存于项目根目录：`data/evansclaw.sqlite`
-- 当前没有 Telegram、飞书等外部消息平台和定时任务；已增加仅监听本机的轻量 Web Gateway
-- Web Gateway 提供单一 Web 会话、HTTP JSON API、审批 API 和 POST + SSE 流式回复
+- 当前没有 Telegram、飞书等外部消息平台和定时任务；Web Gateway 默认监听本机，配置 Bearer Token 后可安全绑定非回环地址
+- Web Gateway 提供动态多会话、HTTP JSON API、审批 API、POST + SSE 流式回复和 React 前端
+- Web API 支持可替换认证器；当前生产装配使用一个 Bearer Token 映射一个服务端 Web 身份
 - CLI 使用会话 ID `personal`，Web 默认使用 `web:local:personal`，避免两个进程共享同一个 Agent 内存状态
 
-模块一“SQLite 会话 + 全文搜索”已完成基础实现和测试。当前还没有 CLI `/search` 命令，搜索能力通过 `SessionStore.search()` API 提供。
+模块一至五的基础实现，以及模块六的 AgentManager、Web 动态多会话和认证边界均已完成。当前还没有 CLI `/search` 命令，搜索能力通过 `SessionStore.search()` API 提供；统一 Channel Adapter 和外部平台接入是下一阶段。
 
 ## 2. 总体目标架构
 
@@ -472,7 +473,7 @@ result_metadata_json, started_at, finished_at
 
 ### 状态：基础实现已完成
 
-D1–D9-C 已完成：Policy、Approval Broker、SQLite 审批持久化、ToolRegistry 授权闸门、Runtime 装配、Web 审批 API/SSE、React 审批卡片和受隔离工作区约束的 `write_file` 均已接通。当前仍没有 Shell、外部通信或破坏性工具；这些工具接入时必须继续声明风险并经过同一闸门。
+D1–D10 已完成：Policy、Approval Broker、SQLite 审批持久化、ToolRegistry 授权闸门、Runtime 装配、Web 审批 API/SSE、React 审批卡片、受隔离工作区约束的 `write_file`，以及 Web Bearer Token 认证均已接通。当前仍没有 Shell、外部通信或破坏性工具；这些工具接入时必须继续声明风险并经过同一闸门。
 
 ### 目标
 
@@ -536,7 +537,7 @@ D1–D9-C 已完成：Policy、Approval Broker、SQLite 审批持久化、ToolRe
 
 - `write_file` 目前只在 Web Runtime 注册，CLI 尚未提供终端审批交互。
 - 尚未接入 Shell、消息发送或外部 API 工具。
-- Web Gateway 仍是本机无认证入口，只适合本机或受信任开发环境；动态会话范围固定在当前 Web 身份。
+- Web Gateway 默认监听本机；配置 Bearer Token 后可绑定非回环地址。当前生产装配仍是一个 Token 对应一个 Web 用户，尚无多 Token、账号登录和会话管理系统。
 - 当前写文件审批/审计按配置保留完整参数，数据库尚无加密和自动清理策略。
 
 ---
