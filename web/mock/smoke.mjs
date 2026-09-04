@@ -57,19 +57,31 @@ try {
     sessionSelect,
     (element) => element.value,
   );
+  const initialSessionCount = await page.$$eval(
+    `${sessionSelect} option`,
+    (options) => options.length,
+  );
   checks.push(["会话选择器", Boolean(initialSessionId)]);
   await page.click('button[aria-label="新建会话"]');
+  // 等待选中值和选项列表都完成 React 提交，避免只观察到中间态。
   await page.waitForFunction(
-    (selector, previousId) => document.querySelector(selector)?.value !== previousId,
+    (selector, previousId, previousCount) => {
+      const select = document.querySelector(selector);
+      return (
+        select?.value !== previousId &&
+        select?.querySelectorAll("option").length === previousCount + 1
+      );
+    },
     { timeout: 15000 },
     sessionSelect,
     initialSessionId,
+    initialSessionCount,
   );
   const sessionCount = await page.$$eval(
     `${sessionSelect} option`,
     (options) => options.length,
   );
-  checks.push(["创建独立会话", sessionCount === 2]);
+  checks.push(["创建独立会话", sessionCount === initialSessionCount + 1]);
   await page.select(sessionSelect, initialSessionId);
   await page.waitForFunction(
     () => document.body.innerText.includes("SQLite 简介"),
