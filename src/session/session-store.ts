@@ -28,6 +28,10 @@ import {
   type ToolAuditStore,
 } from "../tools/tool-audit.js";
 import {
+  SqliteChannelEventStore,
+  type ChannelEventStore,
+} from "../channel/channel-event-store.js";
+import {
   initializeSessionSchema,
 } from "./session-schema.js";
 import {
@@ -584,6 +588,8 @@ export class SqliteSessionStore
   implements SessionStore, ToolAuditStore, ApprovalStore
 {
   private readonly database: DatabaseSync;
+  /** Channel event state shares this store's SQLite connection and owner. */
+  readonly channelEventStore: ChannelEventStore;
   private readonly approvalOwnerId = randomUUID();
   private readonly getSessionStatement: StatementSync;
   private readonly insertSessionStatement: StatementSync;
@@ -619,6 +625,7 @@ export class SqliteSessionStore
         PRAGMA busy_timeout = 1000;
       `);
       initializeSessionSchema(this.database);
+      this.channelEventStore = new SqliteChannelEventStore(this.database);
     } catch (error) {
       // Schema 初始化失败时必须关闭数据库文件描述符，尤其要保证调用方
       // 可以顺利删除有问题的本地数据库。

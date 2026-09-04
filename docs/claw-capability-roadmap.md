@@ -654,13 +654,22 @@ Session route 的规范化元组包含：
 
 原始平台 ID 不直接拼接为 session ID。V1 外部渠道固定使用 `read-only` profile，只支持一对一私聊；群聊、审批、富媒体和流式编辑留到后续阶段。
 
+### 阶段 2 状态：SQLite Inbox/Outbox 与崩溃恢复已完成
+
+阶段 2 已把外部渠道的传输状态落到与会话共用的 SQLite 连接中，但没有混入 canonical `messages`：
+
+- `channel_inbox`：以 `adapter_id + account_id + external_message_id` 唯一去重，记录标准化入站事件、全局递增 sequence 和 `received/running/completed/failed/uncertain` 状态；
+- `channel_outbox`：记录最终回复、目标 adapter/account、投递尝试次数、下一次重试时间、平台回执和 `pending/sending/sent/failed/dead/uncertain` 状态；
+- `ChannelEventStore`：同时提供 SQLite 和内存实现，支持 claim、状态单向转换、按到期时间 claim Outbox，以及 Inbox 完成与 Outbox 入队的原子操作；
+- `recoverInFlight()`：应用启动时把遗留的 `running/sending` 标记为 `uncertain`；`received` 事件可以继续交给后续 Dispatcher，`uncertain` 入站 turn 默认不自动重跑；
+- Outbox 投递失败只改变 Outbox 状态，不重新执行已经完成的 Agent turn。
+
 ### 后续实现阶段
 
-1. 增加 SQLite Inbox/Outbox 和崩溃恢复；
-2. 实现 ChannelGateway、AgentManager 调度和最终回复聚合；
-3. 实现 Telegram Long Polling Adapter；
-4. 增加运行入口、Allowlist 配置和端到端测试；
-5. 在可靠性验证后再接入飞书、钉钉等其他平台。
+1. 实现 ChannelGateway、AgentManager 调度和最终回复聚合；
+2. 实现 Telegram Long Polling Adapter；
+3. 增加运行入口、Allowlist 配置和端到端测试；
+4. 在可靠性验证后再接入飞书、钉钉等其他平台。
 
 现有 Web Gateway 继续保留自己的 REST/SSE/审批接口，CLI 继续使用本地交互循环；两者共享 AgentManager/ChatService，但暂不强行实现 Push ChannelAdapter。
 

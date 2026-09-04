@@ -5,7 +5,7 @@ import type { DatabaseSync } from "node:sqlite";
  * 只有迁移事务提交成功后才记录版本，因此初始化失败时可以安全重试，
  * 不会把未完成的迁移误认为已经成功。
  */
-export const SESSION_SCHEMA_VERSION = 4;
+export const SESSION_SCHEMA_VERSION = 5;
 
 type Migration = {
   version: number;
@@ -249,6 +249,87 @@ const MIGRATIONS: readonly Migration[] = [
 
         CREATE INDEX idx_approval_requests_request
           ON approval_requests(request_id, tool_call_id);
+      `);
+    },
+  },
+  {
+    version: 5,
+    up(database) {
+      database.exec(`
+        -- 外部渠道的去重与处理状态不属于 canonical messages，因此独立保存。
+        -- session_id 不设外键：事件可以先被可靠 claim，再等待 Agent Session 初始化，
+        -- 进程崩溃后也能从 Inbox 恢复，而不会因为运行时尚未创建会话而丢失事件。
+        CREATE TABLE channel_inbox (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          adapter_id TEXT NOT NULL,
+          channel TEXT NOT NULL,
+          account_id TEXT NOT NULL,
+          external_message_id TEXT NOT NULL,
+          external_conversation_id TEXT NOT NULL,
+          conversation_kind TEXT NOT NULL CHECK (
+            conversation_kind IN ('direct', 'group', 'channel')
+          ),
+          sender_id TEXT NOT NULL,
+          text TEXT NOT NULL,
+          received_at INTEGER NOT NULL CHECK (received_at >= 0),
+          reply_to_message_id TEXT,
+          session_id TEXT NOT NULL,
+          user_id TEXT NOT NULL,
+          status TEXT NOT NULL CHECK (
+            status IN ('received', 'running', 'completed', 'failed', 'uncertain')
+          ),
+          error_message TEXT,
+          started_at INTEGER,
+          completed_at INTEGER,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          UNIQUE(adapter_id, account_id, external_message_id)
+        );
+
+        CREATE INDEX idx_channel_inbox_session_sequence
+          ON channel_inbox(session_id, id ASC);
+
+        CREATE INDEX idx_channel_inbox_status_sequence
+          ON channel_inbox(status, id ASC);
+
+        CREATE INDEX idx_channel_inbox_adapter_received
+          ON channel_inbox(adapter_id, account_id, received_at DESC);
+
+        -- Outbox 同时支持由 Inbox 触发的回复和未来 Cron 等主动投递，
+        -- 因此 inbox_id 可以为空；delivery_id 由应用层稳定生成并全局唯一。
+        CREATE TABLE channel_outbox (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          delivery_id TEXT NOT NULL UNIQUE,
+          inbox_id INTEGER REFERENCES channel_inbox(id) ON DELETE SET NULL,
+          adapter_id TEXT NOT NULL,
+          channel TEXT NOT NULL,
+          account_id TEXT NOT NULL,
+          session_id TEXT NOT NULL,
+          user_id TEXT NOT NULL,
+          external_conversation_id TEXT NOT NULL,
+          reply_to_message_id TEXT,
+          text TEXT NOT NULL,
+          format TEXT NOT NULL CHECK (format IN ('plain', 'markdown')),
+          status TEXT NOT NULL CHECK (
+            status IN ('pending', 'sending', 'sent', 'failed', 'dead', 'uncertain')
+          ),
+          attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+          next_attempt_at INTEGER NOT NULL,
+          last_error TEXT,
+          platform_message_ids_json TEXT,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          sent_at INTEGER
+        );
+
+        CREATE INDEX idx_channel_outbox_due
+          ON channel_outbox(status, next_attempt_at, id ASC);
+
+        CREATE INDEX idx_channel_outbox_inbox
+          ON channel_outbox(inbox_id, id ASC);
+
+        CREATE INDEX idx_channel_outbox_adapter_due
+          ON channel_outbox(adapter_id, account_id, status, next_attempt_at);
       `);
     },
   },

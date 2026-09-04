@@ -69,6 +69,8 @@ test("initializes the structured schema and records migration version", () => {
         "session_compactions",
         "tool_calls",
         "approval_requests",
+        "channel_inbox",
+        "channel_outbox",
       ].every((name) => names.has(name)),
       true,
     );
@@ -76,7 +78,7 @@ test("initializes the structured schema and records migration version", () => {
       (database
         .prepare("SELECT MAX(version) AS version FROM schema_migrations")
         .get() as { version: number }).version,
-      4,
+      5,
     );
 
     const columns = database
@@ -135,7 +137,7 @@ test("会话存储可以按渠道和用户列出会话，并读取单个会话",
   }
 });
 
-test("将已有 schema v2 数据库升级到 schema v4", () => {
+test("将已有 schema v2 数据库升级到 schema v5", () => {
   const fixture = createDatabaseFixture();
   try {
     const firstStore = new SqliteSessionStore(fixture.path);
@@ -143,9 +145,11 @@ test("将已有 schema v2 数据库升级到 schema v4", () => {
 
     const database = new DatabaseSync(fixture.path);
     database.exec(`
+      DROP TABLE channel_outbox;
+      DROP TABLE channel_inbox;
       DROP TABLE approval_requests;
       DROP TABLE tool_calls;
-      DELETE FROM schema_migrations WHERE version IN (3, 4);
+      DELETE FROM schema_migrations WHERE version IN (3, 4, 5);
     `);
     database.close();
 
@@ -157,7 +161,7 @@ test("将已有 schema v2 数据库升级到 schema v4", () => {
       (upgradedDatabase
         .prepare("SELECT MAX(version) AS version FROM schema_migrations")
         .get() as { version: number }).version,
-      4,
+      5,
     );
     assert.equal(
       (upgradedDatabase

@@ -5,6 +5,11 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import { createAgentManagerRuntime } from "../src/app/agent-manager-runtime.js";
+import type {
+  ChannelInboxInput,
+  ChannelOutboxInput,
+} from "../src/channel/channel-event-store.js";
+import { SqliteSessionStore } from "../src/session/session-store.js";
 import type { ApprovalRequest } from "../src/tools/approval-broker.js";
 
 const baseDescriptor = {
@@ -14,6 +19,93 @@ const baseDescriptor = {
   identity: { authenticated: true },
   profile: "web-workspace" as const,
 };
+
+test("AgentManager Runtime 启动时恢复 transport in-flight 状态", async () => {
+  const directory = await mkdtemp(
+    path.join(tmpdir(), "evansclaw-agent-manager-recovery-test-"),
+  );
+  const databasePath = path.join(directory, "session.sqlite");
+  const firstStore = new SqliteSessionStore(databasePath);
+  const adapter = {
+    adapterId: "telegram-primary",
+    channel: "telegram",
+    accountId: "primary",
+  } as const;
+  const inbox: ChannelInboxInput = {
+    adapter,
+    sessionId: "telegram:session:recovery",
+    userId: "telegram:primary:user:recovery",
+    message: {
+      externalMessageId: "update-recovery",
+      externalConversationId: "chat-recovery",
+      conversationKind: "direct",
+      senderId: "sender-recovery",
+      text: "恢复",
+      receivedAt: 100,
+    },
+  };
+  const outbox: ChannelOutboxInput = {
+    adapter,
+    sessionId: inbox.sessionId,
+    userId: inbox.userId,
+    delivery: {
+      deliveryId: "delivery-recovery",
+      externalConversationId: inbox.message.externalConversationId,
+      text: "已恢复",
+      format: "plain",
+    },
+  };
+
+  try {
+    const claim = await firstStore.channelEventStore.claimInbound(inbox, 110);
+    assert.equal(await firstStore.channelEventStore.markInboundRunning(claim.record.id, 120), true);
+    const [created] = await firstStore.channelEventStore.finalizeInbound(
+      claim.record.id,
+      [outbox],
+      130,
+    );
+    assert.ok(created);
+    assert.equal(
+      (await firstStore.channelEventStore.claimDueOutbox({ now: 130 }))[0]?.status,
+      "sending",
+    );
+    const runningInbox = await firstStore.channelEventStore.claimInbound(
+      {
+        ...inbox,
+        message: {
+          ...inbox.message,
+          externalMessageId: "update-recovery-running",
+        },
+      },
+      140,
+    );
+    assert.equal(
+      await firstStore.channelEventStore.markInboundRunning(runningInbox.record.id, 150),
+      true,
+    );
+  } finally {
+    firstStore.close();
+  }
+
+  const runtime = await createAgentManagerRuntime({ databasePath });
+  try {
+    assert.equal(
+      (await runtime.channelEventStore.getInbox(1))?.status,
+      "completed",
+    );
+    assert.equal(
+      (await runtime.channelEventStore.getOutbox(1))?.status,
+      "uncertain",
+    );
+    assert.equal(
+      (await runtime.channelEventStore.getInbox(2))?.status,
+      "uncertain",
+    );
+  } finally {
+    await runtime.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 
 test("AgentManager Runtime 在多个 session 间共享 Store/Broker，但隔离 AgentTools", async () => {
   const directory = await mkdtemp(
@@ -32,6 +124,10 @@ test("AgentManager Runtime 在多个 session 间共享 Store/Broker，但隔离 
       sessionId: "web:local:first",
     });
     assert.strictEqual(runtime.manager.sessionStore, runtime.sessionStore);
+    assert.strictEqual(
+      runtime.channelEventStore,
+      runtime.sessionStore.channelEventStore,
+    );
     assert.strictEqual(runtime.manager.approvalBroker, runtime.approvalBroker);
     assert.ok(first.toolRegistry?.get("write_file"));
 

@@ -141,11 +141,21 @@ skills/<skill-name>/SKILL.md
 const runtime = await createAgentManagerRuntime({
   databasePath: "data/evansclaw.sqlite",
 });
+const route = createChannelSessionRoute({
+  adapter: {
+    adapterId: "telegram-primary",
+    channel: "telegram",
+    accountId: "primary",
+  },
+  conversationKind: "direct",
+  externalConversationId: "123456",
+  canonicalUserId: "telegram:primary:user:123456",
+});
 const session = await runtime.manager.getOrCreate({
-  sessionId: "telegram:user:123456",
-  channel: "telegram",
-  conversationId: "123456",
-  userId: "123456",
+  sessionId: route.sessionId,
+  channel: route.channel,
+  conversationId: route.conversationId,
+  userId: route.userId,
   identity: { authenticated: true },
   profile: "read-only",
 });
@@ -154,11 +164,18 @@ await session.send("你好", (delta) => process.stdout.write(delta));
 
 一个 Manager 共享一个 `SqliteSessionStore` 和一个 `ApprovalBroker`；每个 session 拥有独立 Agent、ChatService 和 ToolRegistry。同一 session 串行执行，不同 session 可以并行。`sessionId` 应由可信的 Gateway/Adapter 生成，不能由用户文本决定。
 
-## 后续设计方向
+## Channel Adapter 与传输状态
 
-1. 抽象统一的 Channel Adapter 和身份解析边界
-2. 增加 Telegram 或飞书 Channel Adapter
-3. 增加长期记忆、定时任务和事件触发
+统一的 ChannelAdapter 协议和可信 Session 路由已完成，当前外部渠道仍未启动实际适配器：
+
+- Adapter 只负责平台协议解析、连接和发送，不直接调用 Agent；
+- 入站消息必须携带 `externalMessageId`，由 SQLite Inbox 按 adapter/account 去重；
+- Allowlist 在服务端映射 canonical `userId`，默认只允许私聊；
+- Session ID 使用版本化元组和 SHA-256 派生，不能由用户文本或客户端字段决定；
+- SQLite Outbox 保存最终回复和投递重试，发送失败不会重新执行 Agent turn；
+- 外部渠道 V1 固定使用 `read-only` profile，不开放 `write_file` 或审批。
+
+阶段 1、2 已完成；下一步是实现 ChannelGateway 调度、Telegram Long Polling Adapter 和运行入口。之后再接入飞书、钉钉等平台。Web 继续使用自己的 REST/SSE Gateway，CLI 继续使用本地交互循环。
 
 Tool Policy、审批 Broker、审批持久化和 Web 审批交互已完成；CLI 仍只注册三个只读工具，Web 另外注册受审批保护的 `write_file`。
 

@@ -14,6 +14,7 @@ import {
   restoreContextMessages,
 } from "../context/context-manager.js";
 import { config } from "../config.js";
+import type { ChannelEventStore } from "../channel/channel-event-store.js";
 import {
   SqliteSessionStore,
   type SessionRecord,
@@ -43,6 +44,8 @@ export interface AgentManagerRuntimeOptions {
 export interface AgentManagerRuntime {
   readonly manager: AgentManager;
   readonly sessionStore: SqliteSessionStore;
+  /** Transport state uses the same SQLite owner as canonical sessions. */
+  readonly channelEventStore: ChannelEventStore;
   readonly approvalBroker: InMemoryApprovalBroker;
   readonly skillRegistry: SkillRegistry;
   readonly workspaceRoot: string;
@@ -68,6 +71,10 @@ export async function createAgentManagerRuntime(
     approvalBroker = new InMemoryApprovalBroker({
       approvalStore: sessionStore,
     });
+    // Recover only transport work left in an in-flight state. `received` Inbox
+    // rows remain available for the future ChannelGateway dispatcher, while
+    // `running` turns are deliberately marked uncertain instead of rerun.
+    await sessionStore.channelEventStore.recoverInFlight();
 
     const skillRegistry = new SkillRegistry([
       {
@@ -118,6 +125,7 @@ export async function createAgentManagerRuntime(
     return {
       manager,
       sessionStore,
+      channelEventStore: sessionStore.channelEventStore,
       approvalBroker: broker,
       skillRegistry,
       workspaceRoot,
