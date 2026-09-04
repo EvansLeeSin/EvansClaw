@@ -606,67 +606,63 @@ npm run dev              # 终端 2：前端开发服务器
 npm run smoke            # 终端 3：无头浏览器冒烟测试
 ```
 
-### 目标
+### 阶段 1 状态：统一协议与可信路由已完成
 
-把 CLI、Telegram、飞书和其他消息平台统一接入同一个 Agent 核心。
+阶段 1 已建立外部消息平台接入的协议边界，暂不改造现有 Web/CLI 入口：
 
-### 建议接口
+- `src/channel/channel-types.ts`：定义适配器身份、入站文本、出站投递、能力和会话路由类型；
+- `src/channel/channel-adapter.ts`：定义 `ChannelAdapter`、`ChannelSink`、`ChannelRegistration` 和入站接受结果；
+- `src/channel/channel-access-policy.ts`：提供安全默认的 Allowlist 策略，空 Allowlist 拒绝所有用户，默认只允许私聊；
+- `src/channel/channel-session-key.ts`：使用版本化 JSON 元组和 SHA-256 派生稳定的、按 adapter/account 隔离的内部 session/conversation ID；
+- `test/channel-contracts.test.ts`：覆盖会话键稳定性、命名空间隔离、非法输入、Allowlist 和冲突配置。
+
+### 标准协议
 
 ```ts
-interface InboundMessage {
-  channel: string;
-  conversationId: string;
-  userId: string;
-  text: string;
-  messageId?: string;
-  receivedAt: number;
-}
-
 interface ChannelAdapter {
-  readonly name: string;
-  start(onMessage: (message: InboundMessage) => Promise<void>): Promise<void>;
-  sendText(conversationId: string, text: string): Promise<void>;
+  readonly identity: ChannelAdapterIdentity;
+  readonly capabilities: ChannelCapabilities;
+  start(sink: ChannelSink): Promise<void>;
+  deliver(
+    message: ChannelOutboundText,
+    signal?: AbortSignal,
+  ): Promise<ChannelDeliveryReceipt>;
   stop(): Promise<void>;
 }
 ```
 
-### 处理链路
+`start()` 只在平台认证并准备接收事件后完成；适配器的轮询、长连接和重连任务在后台运行，`stop()` 必须幂等地停止这些任务。入站消息必须携带不可变的 `externalMessageId`，由后续 Inbox 层负责持久化去重。出站投递使用本地 `deliveryId`，明确采用 at-least-once 语义。
+
+### 可信路由规则
 
 ```text
 平台事件
-  → Channel Adapter 标准化
-  → 用户授权检查
-  → 生成 session key
-  → AgentManager 获取 Agent
+  → Adapter 验证并标准化
+  → ChannelAccessPolicy 返回服务端 userId
+  → Inbox claim（后续阶段）
+  → 生成 session route
+  → AgentManager 获取 AgentSessionHandle
   → ChatService 处理
-  → 流式/分段发送回复
+  → Outbox / DeliveryWorker（后续阶段）
 ```
 
-建议 session key：
+Session route 的规范化元组包含：
 
 ```text
-telegram:user:123456
-feishu:chat:oc_xxx
-cli:personal
+[版本、adapterId、channel、accountId、conversationKind、外部 conversationId、canonicalUserId]
 ```
 
-### 关键设计
+原始平台 ID 不直接拼接为 session ID。V1 外部渠道固定使用 `read-only` profile，只支持一对一私聊；群聊、审批、富媒体和流式编辑留到后续阶段。
 
-- Channel 不直接操作 `pi-agent-core`。
-- 每个用户/会话独立维护上下文。
-- 同一会话的消息必须串行处理。
-- 不同会话可以并行处理。
-- 长回复需要分段、编辑消息或使用平台流式能力。
-- 网关启动和停止要可控，异常需要重连。
-- 默认使用 Allowlist 或 DM Pairing，不能默认公开接收消息。
+### 后续实现阶段
 
-### 验收标准
+1. 增加 SQLite Inbox/Outbox 和崩溃恢复；
+2. 实现 ChannelGateway、AgentManager 调度和最终回复聚合；
+3. 实现 Telegram Long Polling Adapter；
+4. 增加运行入口、Allowlist 配置和端到端测试；
+5. 在可靠性验证后再接入飞书、钉钉等其他平台。
 
-- CLI 与外部平台使用同一个 `ChatService`。
-- 不同平台的会话相互隔离。
-- 未授权用户无法调用 Agent。
-- 同一会话连续发送消息不会造成历史交错。
-- 平台发送失败不会丢失内部会话记录。
+现有 Web Gateway 继续保留自己的 REST/SSE/审批接口，CLI 继续使用本地交互循环；两者共享 AgentManager/ChatService，但暂不强行实现 Push ChannelAdapter。
 
 ---
 
