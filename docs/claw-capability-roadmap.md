@@ -639,11 +639,13 @@ interface ChannelAdapter {
 平台事件
   → Adapter 验证并标准化
   → ChannelAccessPolicy 返回服务端 userId
-  → Inbox claim（后续阶段）
   → 生成 session route
+  → Inbox claim
+  → ChannelGateway 按 session 排队
   → AgentManager 获取 AgentSessionHandle
-  → ChatService 处理
-  → Outbox / DeliveryWorker（后续阶段）
+  → ChatService 处理并聚合最终回复
+  → 原子完成 Inbox + 写入 Outbox
+  → DeliveryWorker 投递与重试
 ```
 
 Session route 的规范化元组包含：
@@ -664,12 +666,23 @@ Session route 的规范化元组包含：
 - `recoverInFlight()`：应用启动时把遗留的 `running/sending` 标记为 `uncertain`；`received` 事件可以继续交给后续 Dispatcher，`uncertain` 入站 turn 默认不自动重跑；
 - Outbox 投递失败只改变 Outbox 状态，不重新执行已经完成的 Agent turn。
 
+### 阶段 3 状态：ChannelGateway 调度与最终回复投递已完成
+
+阶段 3 已将可信路由、Inbox/Outbox 和 AgentManager 串联起来：
+
+- `ChannelGateway` 为每个注册 Adapter 创建受 profile 固定约束的 `ChannelSink`；
+- 入站事件先经过 AccessPolicy、Session route 和 Inbox claim，未授权事件不会创建 Agent Session；
+- 同一派生 session 通过 Gateway 队列严格串行，不同 session 可以并行；AgentManager 仍是最终的 session 生命周期边界；
+- Gateway 只收集 `ChatService` 的最终文本，模型 turn 完成后原子完成 Inbox 并创建 Outbox；空回复不会生成平台消息；
+- `ChannelDeliveryWorker` 只处理 Outbox，支持批量 claim、指数退避、最大尝试次数、dead 状态和 AbortSignal 关闭；投递失败绝不重跑 Agent；
+- 启动时会重新调度遗留的 `received` Inbox；`uncertain` 入站 turn 不会自动重跑；
+- Gateway 停止接收新事件、停止 Adapter 和投递调用后，再等待已 claim 的入站队列；它不会关闭共享 AgentManager 或 SQLite。
+
 ### 后续实现阶段
 
-1. 实现 ChannelGateway、AgentManager 调度和最终回复聚合；
-2. 实现 Telegram Long Polling Adapter；
-3. 增加运行入口、Allowlist 配置和端到端测试；
-4. 在可靠性验证后再接入飞书、钉钉等其他平台。
+1. 实现 Telegram Long Polling Adapter；
+2. 增加 Telegram 运行入口、Allowlist 配置和端到端测试；
+3. 在可靠性验证后再接入飞书、钉钉等其他平台。
 
 现有 Web Gateway 继续保留自己的 REST/SSE/审批接口，CLI 继续使用本地交互循环；两者共享 AgentManager/ChatService，但暂不强行实现 Push ChannelAdapter。
 

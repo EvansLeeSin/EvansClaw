@@ -94,7 +94,13 @@ test("ChannelEventStore claims an inbound event once and detects conflicting rep
     assert.equal(accepted.record.sequence, accepted.record.id);
     assert.equal(accepted.record.status, "received");
 
-    const duplicate = await store.claimInbound(inboxInput, 1_700_000_000_002);
+    const duplicate = await store.claimInbound(
+      {
+        ...inboxInput,
+        message: { ...message, receivedAt: message.receivedAt + 1_000 },
+      },
+      1_700_000_000_002,
+    );
     assert.equal(duplicate.status, "duplicate");
     assert.equal(duplicate.record.id, accepted.record.id);
     assert.equal(duplicate.record.createdAt, 1_700_000_000_001);

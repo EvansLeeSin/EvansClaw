@@ -175,7 +175,7 @@ await session.send("你好", (delta) => process.stdout.write(delta));
 - SQLite Outbox 保存最终回复和投递重试，发送失败不会重新执行 Agent turn；
 - 外部渠道 V1 固定使用 `read-only` profile，不开放 `write_file` 或审批。
 
-阶段 1、2 已完成；下一步是实现 ChannelGateway 调度、Telegram Long Polling Adapter 和运行入口。之后再接入飞书、钉钉等平台。Web 继续使用自己的 REST/SSE Gateway，CLI 继续使用本地交互循环。
+阶段 1、2、3 已完成：ChannelGateway 已把可信路由、Inbox、AgentManager、ChatService 和 Outbox/DeliveryWorker 串联起来；下一步是实现 Telegram Long Polling Adapter 和运行入口。之后再接入飞书、钉钉等平台。Web 继续使用自己的 REST/SSE Gateway，CLI 继续使用本地交互循环。
 
 Tool Policy、审批 Broker、审批持久化和 Web 审批交互已完成；CLI 仍只注册三个只读工具，Web 另外注册受审批保护的 `write_file`。
 
