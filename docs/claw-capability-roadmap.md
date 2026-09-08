@@ -20,7 +20,7 @@
 - 支持按 `channel`、`userId`、`conversationId` 和 `sessionId` 隔离搜索
 - 使用 migration 表、事务、WAL 和 SQLite 写锁重试
 - 数据库固定保存于项目根目录：`data/evansclaw.sqlite`
-- 当前没有 Telegram、飞书等外部消息平台和定时任务；Web Gateway 默认监听本机，配置 Bearer Token 后可安全绑定非回环地址
+- Telegram 私聊 Long Polling 入口与离线全链路测试已完成，真实 Bot 联调待验证；飞书等其他平台和定时任务尚未实现。Web Gateway 默认监听本机，配置 Bearer Token 后可安全绑定非回环地址
 - Web Gateway 提供动态多会话、HTTP JSON API、审批 API、POST + SSE 流式回复和 React 前端
 - Web API 支持可替换认证器；当前生产装配使用一个 Bearer Token 映射一个服务端 Web 身份
 - CLI 使用会话 ID `personal`，Web 默认使用 `web:local:personal`，避免两个进程共享同一个 Agent 内存状态
@@ -676,7 +676,7 @@ Session route 的规范化元组包含：
 - Gateway 只收集 `ChatService` 的最终文本，模型 turn 完成后原子完成 Inbox 并创建 Outbox；空回复不会生成平台消息；
 - `ChannelDeliveryWorker` 只处理 Outbox，支持批量 claim、指数退避、最大尝试次数、dead 状态和 AbortSignal 关闭；投递失败绝不重跑 Agent；
 - 启动时会重新调度遗留的 `received` Inbox；`uncertain` 入站 turn 不会自动重跑；
-- Gateway 停止接收新事件、停止 Adapter 和投递调用后，再等待已 claim 的入站队列；它不会关闭共享 AgentManager 或 SQLite。
+- Gateway 停止接收新事件后，先停止 DeliveryWorker，再停止 Adapter，最后等待已 claim 的入站队列；先取消 worker 确保关闭中的投递保持可重试，不因达到最大尝试次数误入 dead。失败启动清理使用相同顺序；Gateway 不关闭共享 AgentManager 或 SQLite。
 
 ### 阶段 4 状态：Telegram Long Polling Adapter 已完成
 
@@ -690,11 +690,20 @@ Session route 的规范化元组包含：
 - 轮询和发送均处理 Telegram 429 的 `retry_after`，网络错误使用有界退避；无效 Token 不会无限重连；
 - `stop()` 会中断当前 Long Polling 请求和等待中的退避，不关闭 Gateway 或共享运行时资源。
 
-### 后续实现阶段
+### 阶段 5 状态：Telegram 运行入口与离线集成测试已完成
 
-1. 增加 Telegram 运行入口、环境变量解析和 Allowlist 配置；
-2. 增加 Telegram 端到端 smoke test 与运行文档；
-3. 在可靠性验证后再接入飞书、钉钉等其他平台。
+- `src/app/telegram-runtime.ts` 在打开数据库前校验 Token、非空数字用户 Allowlist 和可选 account ID；注册身份及 canonical userId 由服务端配置派生，固定 direct-only / read-only。
+- `src/telegram-main.ts` 通过 `npm run telegram` 启动共享 AgentManager runtime、TelegramAdapter 和 ChannelGateway；失败启动会清理资源，SIGINT/SIGTERM 幂等关闭先停止/排空 Gateway，再关闭 Manager/SQLite。
+- 轮询 Token 失效时停止进程；HTTP 请求有 60 秒上限，Adapter 停止会取消发送调用，诊断不打印原始错误或凭据。
+- `test/telegram-runtime.test.ts` 用真实 Adapter → Gateway → AgentManager → Agent/ChatService → SQLite/Outbox 配合假模型流、假 Telegram HTTP，验证配置拒绝、陌生用户/群聊拒绝、重复事件只执行一次、canonical 消息与回复持久化、启动失败/停止、重启恢复与只读工具边界。
+- `README.md` 的“运行 Telegram”包含完整 PowerShell 配置。必填 `DEEPSEEK_API_KEY`、`EVANSCLAW_TELEGRAM_BOT_TOKEN`、`EVANSCLAW_TELEGRAM_ALLOWED_USER_IDS`；可选 `EVANSCLAW_TELEGRAM_ACCOUNT_ID` 默认 `primary`。
+
+限制保持明确：每个 Bot 单 poller、每个数据库单运行时所有者；已有 Webhook 需人工取消，本入口不主动变更。出站 at-least-once，部分分片成功后重试可能重复；`uncertain` 入站不会自动重跑。本阶段没有真实 Token 或网络联调证据，不等同于线上验收。
+
+### 后续验证与扩展
+
+1. 按 README 配置真实 Bot，验证本地网络、私聊接收/回复与停止重启；
+2. 在可靠性验证后再接入飞书、钉钉等其他平台。
 
 现有 Web Gateway 继续保留自己的 REST/SSE/审批接口，CLI 继续使用本地交互循环；两者共享 AgentManager/ChatService，但暂不强行实现 Push ChannelAdapter。
 

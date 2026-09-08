@@ -8,6 +8,7 @@
     "dev": "tsx src/main.ts",
     "start": "node --import tsx src/main.ts",
     "dev:web": "tsx src/web-main.ts",
+    "telegram": "node --import tsx src/telegram-main.ts",
     "preweb": "npm run build:ui",
     "web": "node --import tsx src/web-main.ts",
     "dev:ui": "npm --prefix web run dev",

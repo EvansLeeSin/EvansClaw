@@ -189,6 +189,9 @@ export class TelegramAdapter implements ChannelAdapter {
         "Telegram Adapter 尚未启动或已经停止，不能投递消息。",
       );
     }
+    // Stop must cancel standalone deliveries as well as Gateway-owned calls.
+    const lifecycleSignal = this.controller!.signal;
+    signal = signal ? AbortSignal.any([signal, lifecycleSignal]) : lifecycleSignal;
     const chatId = requiredIdentifier(
       message.externalConversationId,
       "externalConversationId",
@@ -288,6 +291,7 @@ export class TelegramAdapter implements ChannelAdapter {
           if (this.statusValue !== "stopping") {
             this.statusValue = "stopped";
             this.sink = undefined;
+            this.controller?.abort();
             this.controller = undefined;
           }
           break;
@@ -447,7 +451,8 @@ function splitTelegramText(text: string): readonly string[] {
 }
 
 function isFatalTelegramError(error: unknown): boolean {
-  return error instanceof TelegramApiError && error.errorCode === 401;
+  return error instanceof TelegramApiError &&
+    (error.errorCode === 401 || error.httpStatus === 401);
 }
 
 function retryAfterMilliseconds(error: unknown): number | undefined {

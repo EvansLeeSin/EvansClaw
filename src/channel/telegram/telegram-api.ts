@@ -160,6 +160,10 @@ export class TelegramBotApi {
     signal: AbortSignal | undefined,
     validate: (value: unknown) => value is T,
   ): Promise<T> {
+    // Telegram's longest server poll is 50s. Bound hung HTTP/body reads too,
+    // while preserving caller cancellation for startup and shutdown.
+    const deadline = AbortSignal.timeout(60_000);
+    signal = signal ? AbortSignal.any([signal, deadline]) : deadline;
     const url = `${this.baseUrl}/bot${this.token}/${method}`;
     let response: Response;
     try {
@@ -222,13 +226,11 @@ function createApiError(
   const retryAfterSeconds = isTelegramParameters(envelope?.parameters)
     ? integerOrUndefined(envelope.parameters.retry_after)
     : undefined;
-  const description =
-    typeof envelope?.description === "string"
-      ? envelope.description
-      : "Telegram API 请求失败。";
+  // Upstream descriptions can echo request URLs. Only retain structured codes
+  // because these errors may also be persisted as Outbox retry diagnostics.
   return new TelegramApiError({
     method,
-    message: `Telegram ${method} 失败：${description}`,
+    message: `Telegram ${method} 请求失败（${errorCode ?? httpStatus}）。`,
     httpStatus,
     errorCode,
     retryAfterSeconds,

@@ -166,7 +166,7 @@ await session.send("你好", (delta) => process.stdout.write(delta));
 
 ## Channel Adapter 与传输状态
 
-统一的 ChannelAdapter 协议、可信 Session 路由和 Telegram Long Polling Adapter 已完成；Telegram 运行入口和生产配置仍在下一阶段：
+统一的 ChannelAdapter 协议、可信 Session 路由、Telegram Long Polling Adapter 和运行入口已完成：
 
 - Adapter 只负责平台协议解析、连接和发送，不直接调用 Agent；
 - 入站消息必须携带 `externalMessageId`，由 SQLite Inbox 按 adapter/account 去重；
@@ -177,7 +177,36 @@ await session.send("你好", (delta) => process.stdout.write(delta));
 - `src/channel/telegram/telegram-adapter.ts` 使用 Long Polling，仅标准化私聊文本，`update_id` 作为入站幂等 ID，并支持最终回复分片、回复引用、429 等待和 AbortSignal 停止；
 - `src/channel/telegram/telegram-api.ts` 使用原生 `fetch` 调用 Bot API，不引入 Telegram SDK，网络错误不会把 Bot Token 写入错误消息。
 
-阶段 1、2、3、4 已完成：ChannelGateway 已把可信路由、Inbox、AgentManager、ChatService 和 Outbox/DeliveryWorker 串联起来，Telegram Adapter 已完成；下一步是增加 Telegram 运行入口、Allowlist 配置和端到端测试。之后再接入飞书、钉钉等平台。Web 继续使用自己的 REST/SSE Gateway，CLI 继续使用本地交互循环。
+阶段 1–5 已完成：Telegram 运行入口、Allowlist 配置及离线全链路集成测试已接入。测试使用真实 Adapter、Gateway、AgentManager、ChatService、Agent 和 SQLite，仅替换模型流及 Telegram HTTP，不需要真实凭据。尚未进行真实 Bot 联调。Web 继续使用自己的 REST/SSE Gateway，CLI 继续使用本地交互循环。
+
+### 运行 Telegram
+
+需要 Node.js 22.19+、可访问 Telegram Bot API 的网络、BotFather 创建的 Bot Token，以及获准用户的 **Telegram 数字 user ID**（不是 username 或群 ID）。仅在本机设置凭据，不要提交到仓库或粘贴进聊天。
+
+```powershell
+npm install
+$env:DEEPSEEK_API_KEY = "<你的 DeepSeek API Key>"
+$env:EVANSCLAW_TELEGRAM_BOT_TOKEN = "<BotFather 提供的 Token>"
+$env:EVANSCLAW_TELEGRAM_ALLOWED_USER_IDS = "123456789,987654321"
+$env:EVANSCLAW_TELEGRAM_ACCOUNT_ID = "primary" # 可省略，默认 primary
+npm run telegram
+```
+
+- Token、非空 Allowlist 必填；用户 ID 必须是安全范围内的正十进制整数。任一错误条目会拒绝整份配置，不会退化为允许所有用户。
+- account ID 只能包含 1–64 位字母、数字、下划线或短横线。每个 Bot 使用稳定且独立的 account ID；更改它会进入新的会话命名空间，不要用同一个 account ID 换成其他 Bot。
+- 启动成功后，用 Allowlist 中的账号私聊 Bot；未知用户不创建 Session，也不触发模型。只注册 `load_skill`、`search_session`、`current_time`；普通“同意/approve”是聊天文本，不是审批。
+- `Ctrl+C` / `SIGTERM` 停止轮询及平台请求，排空已接受的 Agent turn 后关闭 SQLite；关闭过程中生成但尚未发送的回复留在 Outbox，供下次启动投递。关闭可能需要等待模型完成。
+
+**运行限制与恢复语义：**
+
+- 每个 Bot 只能运行一个 Long Polling 实例；不要同时运行其他 Bot 程序。若 Bot 已配置 Webhook，先由管理员使用 Telegram `deleteWebhook` 取消（不要选择丢弃待处理消息）；本程序不会自动修改 Webhook。冲突通常表现为 409 错误。
+- 当前入口独占默认 `data/evansclaw.sqlite` 的运行时恢复所有权。不要与另一个 Telegram/Web/CLI 进程同时打开同一数据库；多入口同进程共享装配尚未提供。SQLite 中保存会话及 Inbox/Outbox 正文，应保护本地数据文件。
+- 只支持私聊文本、最终纯文本回复；不支持群聊、媒体、Webhook、流式编辑或按钮审批。超过 4096 字符的回复分片发送，最多 100 片。
+- 出站为 **at-least-once**：网络结果不确定、关闭或部分分片已发出时，重试可能产生重复消息/重复前缀；发送失败不会重新运行模型。重试耗尽进入 `dead`，需要人工检查，不提供自动无限重试或管理界面。
+- 重启恢复 `received` 入站及待发/失败/不确定 Outbox；崩溃遗留的 `running` 入站变为 `uncertain`，**不会自动重新执行**。Telegram 未确认 update 可重投，由 Inbox 去重；不要删除数据库来“重置 offset”。
+- 轮询 401 会关闭运行时并以失败状态退出；网络故障及 429 会退避重试，单次 HTTP 请求最长 60 秒。终端不输出 Token 或原始异常正文。
+
+离线验证：`node --import tsx --test test/telegram-runtime.test.ts test/telegram-adapter.test.ts`。真实 Bot 的接收、发送及网络可用性仍需按上述配置手工验证。
 
 Tool Policy、审批 Broker、审批持久化和 Web 审批交互已完成；CLI 仍只注册三个只读工具，Web 另外注册受审批保护的 `write_file`。
 

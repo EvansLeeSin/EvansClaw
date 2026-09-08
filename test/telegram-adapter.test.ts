@@ -312,3 +312,49 @@ test("TelegramAdapter 对网络错误退避，并在轮询收到 401 后停止�
   assert.equal(errors.length, 2);
   await adapter.stop();
 });
+
+test("TelegramAdapter stop cancels sendMessage without a caller signal", async () => {
+  let sending = false;
+  const http = new FakeTelegramHttp((method, _body, signal) => {
+    if (method === "getMe") return telegramResponse(botUser());
+    if (method === "sendMessage") sending = true;
+    return pendingUntilAbort(signal);
+  });
+  const adapter = new TelegramAdapter({ token: "900:offline-token", fetch: http.fetch });
+  await adapter.start({ accept: async () => ({ status: "accepted" }) });
+  try {
+    const delivery = adapter.deliver(channelMessage("test"));
+    const rejected = assert.rejects(delivery);
+    await waitFor(() => sending);
+    await adapter.stop();
+    await rejected;
+    assert.equal(adapter.status, "stopped");
+  } finally { await adapter.stop(); }
+});
+
+test("TelegramAdapter stops on an HTTP 401 even when its body is not JSON", async () => {
+  const http = new FakeTelegramHttp((method) => method === "getMe"
+    ? telegramResponse(botUser()) : new Response("Unauthorized", { status: 401 }));
+  const adapter = new TelegramAdapter({ token: "900:offline-token", fetch: http.fetch });
+  try {
+    await adapter.start({ accept: async () => ({ status: "accepted" }) });
+    await waitFor(() => adapter.status === "stopped");
+    assert.equal(http.requests.length, 2);
+  } finally { await adapter.stop(); }
+});
+
+test("TelegramBotApi does not expose tokens from network errors or API descriptions", async () => {
+  const token = "900:secret-test-token";
+  for (const network of [false, true]) {
+    const api = new TelegramBotApi({ token, fetch: async () => {
+      if (network) throw new Error(`fetch https://api.telegram.org/bot${token}/sendMessage`);
+      return telegramError(401, `bad token ${token}`);
+    } });
+    await assert.rejects(api.getMe(), (error: Error) => {
+      assert.ok(error instanceof TelegramApiError);
+      assert.equal(error.message.includes(token), false);
+      assert.equal(error.stack?.includes(token), false);
+      return true;
+    });
+  }
+});

@@ -157,8 +157,9 @@ export class ChannelGateway {
     } catch (error) {
       if (this.state === "starting") {
         this.accepting = false;
-        await this.stopAdapters();
+        // Mark worker cancellations before adapter lifecycle signals abort sends.
         await this.deliveryWorker.stop();
+        await this.stopAdapters();
         await this.waitForAcceptsAndInbound();
         this.state = "idle";
       }
@@ -474,8 +475,10 @@ export class ChannelGateway {
   }
 
   private async stopInternal(): Promise<void> {
-    await this.stopAdapters();
+    // A shutdown cancellation must remain retryable even on the last attempt.
+    // Stop the worker first so its controllers classify aborted sends correctly.
     await this.deliveryWorker.stop();
+    await this.stopAdapters();
     const starting = this.startPromise;
     if (starting) {
       await starting.catch((error) =>
