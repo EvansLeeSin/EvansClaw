@@ -15,6 +15,7 @@ import {
   RotateCcwIcon,
   SendIcon,
   SparklesIcon,
+  UsersIcon,
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -363,6 +364,13 @@ export function ChatView() {
           </p>
         </div>
         <div className="ml-auto flex min-w-0 items-center gap-2">
+          <a
+            href="#/room"
+            className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground"
+          >
+            <UsersIcon className="size-3.5" />
+            <span className="hidden sm:inline">聊天室</span>
+          </a>
           {session && (
             <span className="hidden text-xs text-muted-foreground sm:inline">
               {session.messageCount} 条消息

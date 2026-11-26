@@ -120,6 +120,47 @@ npm run dev:ui      # 终端 2：Vite http://localhost:5173，/api 代理到 878
 
 Gateway 默认只监听本机；回环地址可以继续使用本机个人入口。若设置 `EVANSCLAW_WEB_TOKEN`，所有会话、消息和审批 API 都要求 `Authorization: Bearer <token>`，浏览器页面会在收到 401 后提示输入 Token，并只保存到当前标签页的 `sessionStorage`。若监听非回环地址，必须配置 `EVANSCLAW_WEB_TOKEN`，否则启动失败。当前一个 Token 映射一个 `EVANSCLAW_WEB_USER_ID`，健康检查和静态前端资源保持公开。
 
+## 多人聊天室（带 AI 角色）
+
+`npm run web` 启动后访问 `http://<host>:8787/#/room`（个人助手页右上角也有「聊天室」入口）。单一房间，适合几个人的小群：
+
+- 成员用 **邀请码 + 昵称** 加入，获得只能访问 `/api/room/*` 的房间令牌；它与个人 Agent 的 `EVANSCLAW_WEB_TOKEN` 完全隔离。
+- 消息通过 SSE（`GET /api/room/events`）实时广播，AI 回复流式显示；记录保存在 `data/room.sqlite`。
+- AI 角色可在侧边栏添加/编辑/停用/删除，每个角色有两种发言模式：
+  - **被动**：只在被 `@名字` 时回复（`@all` / `@大家` 呼叫所有 AI）；
+  - **主动**：每条新消息都让 AI 自行判断是否插话（不插话时模型输出 `[PASS]`，界面无感知），真正插话后有冷却时间。
+- 切换模式：侧边栏「被动/主动」开关，或直接在群里说「@小E 开启主动发言」「@小E 只在被@时说话」，AI 会调用 `set_reply_mode` 工具切换自己。
+- 防刷屏：每个 AI 同时只生成一条回复（忙碌时再被 @ 会在结束后补答一次）；AI 之间互相 @ 最多 2 层；每条消息最多触发 2 个主动 AI。
+
+| 环境变量 | 说明 |
+| --- | --- |
+| `EVANSCLAW_ROOM_INVITE_CODE` | 邀请码。监听非本机地址时**必须**设置，否则聊天室不启用 |
+| `EVANSCLAW_ROOM_ENABLED=false` | 关闭聊天室 |
+| `EVANSCLAW_ROOM_DB` | 房间数据库路径，默认 `data/room.sqlite` |
+
+### AI 角色使用不同模型（OpenAI Responses 协议）
+
+每个 AI 角色可以单独选择模型，未选择时使用默认的 DeepSeek 模型。把 `models.example.yaml` 复制为 `data/models.yaml`（或用 `EVANSCLAW_MODELS_CONFIG` 指定路径），然后声明 `api: openai-responses` 的 Provider：
+
+```yaml
+providers:
+  - id: openai
+    api: openai-responses
+    baseUrl: https://api.openai.com/v1   # 也可以填兼容 Responses 协议的网关
+    apiKeyEnv: OPENAI_API_KEY            # 只写环境变量名
+    models: [gpt-5.4-mini, gpt-5.4]
+```
+
+重启后，在侧边栏编辑角色就能选择模型。下拉框会标出缺少 API Key 的 Provider。配置有误时会在启动时直接报错。
+
+对外开放示例（个人 Agent 仍需 Token 保护）：
+
+```bash
+EVANSCLAW_WEB_HOST=0.0.0.0 EVANSCLAW_WEB_TOKEN=<长随机串> EVANSCLAW_ROOM_INVITE_CODE=<邀请码> npm run web
+```
+
+建议在前面放 Caddy/Nginx 提供 HTTPS，并关闭代理对 `/api/room/events` 的响应缓冲。
+
 ## Skills
 
 把 Skill 放到以下目录之一：

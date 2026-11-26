@@ -7,6 +7,8 @@ import {
   BearerTokenAuthenticator,
 } from "./gateway/web-auth.js";
 import { createDynamicWebGateway } from "./gateway/web-runtime.js";
+import { createRoomRuntime, type RoomRuntime } from "./room/room-runtime.js";
+import { modelCatalog } from "./agent/create-agent.js";
 
 const DEFAULT_WEB_SESSION_ID = "web:local:personal";
 const DEFAULT_WEB_USER_ID = "local";
@@ -97,6 +99,32 @@ async function main(): Promise<void> {
     await runtime.close();
     throw error;
   }
+  // 多人聊天室：监听远程地址时必须配置邀请码，否则不启用。
+  const roomInviteCode = process.env.EVANSCLAW_ROOM_INVITE_CODE?.trim();
+  const roomDisabled = process.env.EVANSCLAW_ROOM_ENABLED === "false";
+  let room: RoomRuntime | undefined;
+  if (!roomDisabled && (roomInviteCode || isLoopbackHost(host))) {
+    try {
+      room = createRoomRuntime({
+        databasePath: process.env.EVANSCLAW_ROOM_DB?.trim() || undefined,
+        inviteCode: roomInviteCode,
+        models: modelCatalog,
+      });
+    } catch (error) {
+      await runtime.close();
+      throw error;
+    }
+  } else if (!roomDisabled) {
+    console.warn("未配置 EVANSCLAW_ROOM_INVITE_CODE，远程模式下聊天室未启用。");
+  }
+  const closeRuntimes = async (): Promise<void> => {
+    try {
+      await room?.close();
+    } finally {
+      await runtime.close();
+    }
+  };
+
   const gateway = createDynamicWebGateway(runtime, {
     host,
     port,
@@ -108,6 +136,7 @@ async function main(): Promise<void> {
     profile: "web-workspace",
     authenticator,
     defaultSessionId: sessionId,
+    room: room?.routes,
   });
 
   let closing = false;
@@ -118,7 +147,7 @@ async function main(): Promise<void> {
     try {
       await gateway.close();
     } finally {
-      await runtime.close();
+      await closeRuntimes();
     }
   };
 
@@ -138,8 +167,11 @@ async function main(): Promise<void> {
       );
     }
     console.log("默认仅监听本机；可通过 EVANSCLAW_WEB_HOST 修改。\n");
+    if (room) {
+      console.log(`多人聊天室：${address.url}/#/room${roomInviteCode ? "（需邀请码）" : ""}`);
+    }
   } catch (error) {
-    await runtime.close();
+    await closeRuntimes();
     throw error;
   }
 }

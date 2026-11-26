@@ -22,6 +22,7 @@ import type {
   ApprovalRequest,
 } from "../tools/approval-broker.js";
 import type { ToolPolicyIdentity } from "../tools/tool-policy.js";
+import type { RoomRoutes } from "../room/room-routes.js";
 import type {
   SessionRecord,
   SessionStore,
@@ -83,6 +84,11 @@ export interface WebGatewayOptions {
    * （SPA 路由）。不设置则维持纯 API 模式。
    */
   staticDir?: string;
+  /**
+   * 可选的多人聊天室路由（/api/room/*）。房间使用独立的邀请码认证，
+   * 不经过个人 Agent 的 authenticator，房间令牌也无法访问其他 API。
+   */
+  room?: RoomRoutes;
 }
 
 export interface WebGatewayAddress {
@@ -132,6 +138,7 @@ export class WebGateway {
   private readonly maxTextChars: number;
   /** 前端静态目录（绝对路径）；未配置时 Gateway 只提供 API。 */
   private readonly staticDir: string | undefined;
+  private readonly room: RoomRoutes | undefined;
   private server: Server | undefined;
   /** Static mode retains the old whole-Gateway queue; manager mode queues per session. */
   private queueTail: Promise<void> = Promise.resolve();
@@ -179,6 +186,7 @@ export class WebGateway {
     this.staticDir = options.staticDir
       ? path.resolve(options.staticDir)
       : undefined;
+    this.room = options.room;
   }
 
   async listen(): Promise<WebGatewayAddress> {
@@ -243,6 +251,9 @@ export class WebGateway {
     const server = this.server;
     if (!server) return;
     this.server = undefined;
+    // 房间 SSE 是长连接，必须先结束，server.close() 才能完成。
+    this.room?.closeStreams();
+    server.closeIdleConnections?.();
     await new Promise<void>((resolve, reject) => {
       server.close((error) => (error ? reject(error) : resolve()));
     });
@@ -275,6 +286,11 @@ export class WebGateway {
         ok: true,
         service: "evansclaw",
       });
+      return;
+    }
+
+    // 聊天室有自己的邀请码/房间令牌认证，在个人 Agent 认证之前分流。
+    if (this.room && (await this.room.handle(request, response, segments))) {
       return;
     }
 

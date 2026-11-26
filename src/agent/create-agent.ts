@@ -5,38 +5,35 @@ import {
   type AgentTool,
   type ToolExecutionMode,
 } from "@earendil-works/pi-agent-core";
-import { createModels, type Api, type Model } from "@earendil-works/pi-ai";
+import type { Api, Model } from "@earendil-works/pi-ai";
 import {
-  DEEPSEEK_ANTHROPIC_PROVIDER_ID,
-  deepseekAnthropicProvider,
-} from "../model/deepseek-anthropic.js";
+  loadModelsConfig,
+  ModelCatalog,
+} from "../model/model-catalog.js";
 import { config } from "../config.js";
 import {
   ContextSummarizer,
   createModelSummaryCompletion,
 } from "../context/context-summarizer.js";
 
-const models = createModels();
-models.setProvider(deepseekAnthropicProvider());
-
-const model: Model<Api> = (() => {
-  const selected = models.getModel(
-    DEEPSEEK_ANTHROPIC_PROVIDER_ID,
-    config.model,
-  );
-  if (!selected) {
-    throw new Error(
-      `找不到模型 ${DEEPSEEK_ANTHROPIC_PROVIDER_ID}/${config.model}。可用模型：deepseek-v4-flash、deepseek-v4-pro。`,
-    );
-  }
-  return selected;
-})();
+/**
+ * 进程级模型目录：内置 DeepSeek，另可通过 data/models.yaml（或
+ * EVANSCLAW_MODELS_CONFIG）接入 OpenAI Responses 协议的 Provider。
+ */
+export const modelCatalog = new ModelCatalog({
+  config: loadModelsConfig(process.env.EVANSCLAW_MODELS_CONFIG?.trim() || undefined),
+  defaultDeepseekModel: config.model,
+});
+const models = modelCatalog.models;
+const model: Model<Api> = modelCatalog.defaultModel;
 
 export interface CreateAgentOptions {
   systemPrompt?: string;
   tools?: AgentTool[];
   /** Tool calls are sequential by default until read-only parallelism is proven. */
   toolExecution?: ToolExecutionMode;
+  /** 指定模型（须来自 modelCatalog）；省略时使用默认 DeepSeek 模型。 */
+  model?: Model<Api>;
 }
 
 export function createAgent(
@@ -46,7 +43,7 @@ export function createAgent(
   return new Agent({
     initialState: {
       systemPrompt: options.systemPrompt ?? config.systemPrompt,
-      model,
+      model: options.model ?? model,
       tools: options.tools ?? [],
       messages,
     },

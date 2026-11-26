@@ -1,0 +1,31 @@
+# EvansClaw 模型配置示例。复制为 data/models.yaml（或用 EVANSCLAW_MODELS_CONFIG 指定路径）后生效。
+#
+# - 内置 DeepSeek（Anthropic 协议，DEEPSEEK_API_KEY）始终可用，且是默认模型。
+# - 这里声明的 Provider 目前支持 OpenAI Responses 协议（api: openai-responses，即 POST {baseUrl}/responses）。
+# - 只写 API Key 的“环境变量名”，不要把密钥写进文件。
+# - 目前仅聊天室的 AI 角色可选择这些模型；个人助手仍使用默认模型。
+
+providers:
+  # OpenAI 官方
+  - id: openai
+    name: OpenAI
+    api: openai-responses
+    baseUrl: https://api.openai.com/v1 # 可省略，默认即此地址
+    apiKeyEnv: OPENAI_API_KEY
+    models:
+      - gpt-5.4-mini # 已知模型自动带上上下文窗口等元数据
+      - gpt-5.4
+
+  # 兼容 Responses 协议的中转网关 / 私有部署（示例）
+  # - id: my-gateway
+  #   name: 公司网关
+  #   api: openai-responses
+  #   baseUrl: https://llm-gateway.example.com/v1
+  #   apiKeyEnv: MY_GATEWAY_API_KEY
+  #   models:
+  #     - id: gpt-5.4-mini
+  #     - id: custom-model
+  #       name: 自定义模型
+  #       contextWindow: 128000
+  #       maxTokens: 16384
+  #       reasoning: false
