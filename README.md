@@ -161,6 +161,24 @@ EVANSCLAW_WEB_HOST=0.0.0.0 EVANSCLAW_WEB_TOKEN=<长随机串> EVANSCLAW_ROOM_INV
 
 建议在前面放 Caddy/Nginx 提供 HTTPS，并关闭代理对 `/api/room/events` 的响应缓冲。
 
+## Docker 部署
+
+仓库自带 `Dockerfile`（多阶段构建：前端构建 → 生产依赖 → 运行时，非 root 的 `node` 用户，带健康检查）和 `docker-compose.yml`：
+
+```bash
+git clone https://github.com/EvansLeeSin/EvansClaw.git && cd EvansClaw
+cp .env.example .env            # 填写 DEEPSEEK_API_KEY、EVANSCLAW_WEB_TOKEN、EVANSCLAW_ROOM_INVITE_CODE
+mkdir -p data && sudo chown 1000:1000 data   # 容器以 uid 1000 运行
+# 可选：cp models.example.yaml data/models.yaml 并按需修改（OpenAI Responses 等模型）
+docker compose up -d --build
+```
+
+- 访问 `http://<服务器>:8787/#/room` 进入聊天室；个人助手在 `/`，需要输入 `EVANSCLAW_WEB_TOKEN`。
+- 数据都在挂载的 `./data` 目录：`evansclaw.sqlite`、`room.sqlite`、`models.yaml`、`workspace/`。备份这个目录即可。
+- 容器内固定监听 `0.0.0.0:8787`，因此 `EVANSCLAW_WEB_TOKEN` 必填；如果不设 `EVANSCLAW_ROOM_INVITE_CODE`，聊天室不会启用。宿主机端口可用 `EVANSCLAW_PUBLISH_PORT` 修改。
+- 升级：`git pull && docker compose up -d --build`。
+- HTTPS：参考 `deploy/Caddyfile.example`。Nginx 需要对 SSE 关闭缓冲（`proxy_buffering off; proxy_read_timeout 1h;`）。
+
 ## Skills
 
 把 Skill 放到以下目录之一：

@@ -1,0 +1,12 @@
+# Caddy 反向代理示例：自动申请 HTTPS 证书。
+# 将 chat.example.com 换成你的域名，并确保 80/443 端口可达。
+#
+#   caddy run --config deploy/Caddyfile.example
+#
+chat.example.com {
+	encode gzip
+	reverse_proxy 127.0.0.1:8787 {
+		# SSE（/api/room/events、对话流）需要立即刷新，不能被缓冲。
+		flush_interval -1
+	}
+}

@@ -1,0 +1,25 @@
+# EvansClaw Docker Compose 部署。
+#
+#   cp .env.example .env   # 填写 Key / Token / 邀请码
+#   docker compose up -d --build
+#
+# 浏览器访问 http://<服务器>:8787/#/room 进入聊天室。
+# 正式对外建议在前面加 HTTPS 反向代理（见 deploy/Caddyfile.example）。
+
+services:
+  evansclaw:
+    build: .
+    image: evansclaw:latest
+    container_name: evansclaw
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      EVANSCLAW_WEB_HOST: 0.0.0.0
+      EVANSCLAW_WEB_PORT: 8787
+    ports:
+      - "${EVANSCLAW_PUBLISH_PORT:-8787}:8787"
+    volumes:
+      # SQLite 数据库、models.yaml、工作区都在这里；容器以 uid 1000（node）运行。
+      - ./data:/app/data
+    # 让 skills 目录可在宿主机上直接修改（可选）：
+    #   - ./skills:/app/skills:ro
